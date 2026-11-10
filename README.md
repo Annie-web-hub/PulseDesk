@@ -4,7 +4,9 @@
 
 PulseDesk is a portfolio project demonstrating how an IT team can manage incidents, people, company assets, service levels and escalation workflows in one responsive workspace. The Northstar Studio demo environment is seeded with fictional records so the app is ready to explore after setup.
 
-![PulseDesk](docs/pulsedesk-preview.png)
+![PulseDesk 3.0 command dashboard](docs/pulsedesk-dashboard-preview.png)
+
+[View the new sign-in design](docs/pulsedesk-login-preview.png)
 
 ## Product capabilities
 
@@ -21,6 +23,10 @@ PulseDesk is a portfolio project demonstrating how an IT team can manage inciden
 - **CSV export:** download an Excel-friendly UTF-8 incident register.
 - **REST endpoint:** expose operational metrics as JSON at `/api/metrics`.
 - **CSRF protection:** validate tokens on state-changing form submissions.
+- **Notification centre:** personal in-app inbox, unread counts, read state and a compact notification popover.
+- **Email alerts:** SMTP delivery for new requests, incident status changes and escalations; delivery outcomes are recorded in an admin-visible outbox.
+- **Live updates:** protected polling API refreshes activity, notification counts, SLA metrics and visible incident rows every eight seconds.
+- **Distinctive operations UI:** a dark control-room interface with live telemetry, signal stream and responsive layouts.
 
 ## Demo accounts
 
@@ -74,6 +80,22 @@ py app.py
 
 Open **http://127.0.0.1:5000** and sign in with one of the demo accounts above.
 
+### Configure real email delivery (optional)
+
+Without SMTP settings, PulseDesk records clearly labelled email previews in the local outbox and does not send messages. To enable outbound alerts, set the following environment variables before starting the app:
+
+```powershell
+$env:PULSEDESK_SMTP_HOST = "smtp.your-provider.example"
+$env:PULSEDESK_SMTP_PORT = "587"
+$env:PULSEDESK_SMTP_FROM = "pulsedesk@your-domain.example"
+$env:PULSEDESK_SMTP_USERNAME = "your-smtp-username"
+$env:PULSEDESK_SMTP_PASSWORD = "your-smtp-app-password"
+$env:PULSEDESK_SMTP_STARTTLS = "1"
+py app.py
+```
+
+Use an SMTP app password or provider-issued credential, not your everyday email password. Keep credentials in environment variables or a secret manager; never commit them to Git. The Admin notification centre shows whether delivery is configured and records sent, preview and failed outcomes.
+
 ## Run the test suite
 
 ```powershell
@@ -95,7 +117,8 @@ pulsedesk/
 ├── tests/
 │   └── test_app.py         # Authentication and workflow integration tests
 ├── docs/
-│   └── pulsedesk-preview.png
+│   ├── pulsedesk-dashboard-preview.png
+│   └── pulsedesk-login-preview.png
 ├── .gitignore
 ├── requirements.txt
 └── README.md
@@ -110,6 +133,8 @@ pulsedesk/
 - The knowledge article renderer escapes source text before emitting its controlled HTML subset.
 - Demo records use fictional names. Do not enter real employee or incident information into this demo.
 - Smart triage is transparent, rule-based assistance—not a trained AI model or a substitute for human impact assessment.
+- Email alerts are sent only when SMTP host and sender settings are present; otherwise the outbox records a preview rather than claiming delivery.
+- The live dashboard uses authenticated eight-second HTTP polling, not a persistent WebSocket connection.
 
 This is a local portfolio demonstration, not a production-ready identity or service-management system. A real deployment needs HTTPS, secure-cookie configuration, MFA, login rate-limiting and lockout controls, password reset procedures, monitored backups, a hardened production WSGI server, and an organisation-specific privacy and retention policy.
 

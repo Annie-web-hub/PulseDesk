@@ -5,7 +5,9 @@ import io
 import os
 import re
 import secrets
+import smtplib
 import sqlite3
+from email.message import EmailMessage
 from functools import wraps
 from html import escape
 from urllib.parse import urlparse
@@ -127,6 +129,108 @@ def log_activity(db: sqlite3.Connection, action: str, detail: str, actor: str = 
     )
 
 
+def smtp_is_configured() -> bool:
+    return bool(os.environ.get("PULSEDESK_SMTP_HOST") and os.environ.get("PULSEDESK_SMTP_FROM"))
+
+
+def deliver_email(db: sqlite3.Connection, recipient: str, subject: str, body: str) -> str:
+    """Send email when SMTP is configured; otherwise retain an honest local preview."""
+    if not recipient:
+        return "skipped"
+    status = "preview"
+    error = ""
+    sent_at = None
+    if smtp_is_configured():
+        try:
+            message = EmailMessage()
+            message["Subject"] = subject[:180]
+            message["From"] = os.environ["PULSEDESK_SMTP_FROM"]
+            message["To"] = recipient
+            message["X-Mailer"] = "PulseDesk"
+            message.set_content(body[:8000])
+            host = os.environ["PULSEDESK_SMTP_HOST"]
+            port = int(os.environ.get("PULSEDESK_SMTP_PORT", "587"))
+            starttls = os.environ.get("PULSEDESK_SMTP_STARTTLS", "1") == "1"
+            with smtplib.SMTP(host, port, timeout=5) as client:
+                client.ehlo()
+                if starttls:
+                    client.starttls()
+                    client.ehlo()
+                username = os.environ.get("PULSEDESK_SMTP_USERNAME", "")
+                password = os.environ.get("PULSEDESK_SMTP_PASSWORD", "")
+                if username:
+                    client.login(username, password)
+                client.send_message(message)
+            status = "sent"
+            sent_at = now_iso()
+        except (OSError, ValueError, smtplib.SMTPException) as exc:
+            status = "failed"
+            error = str(exc)[:300]
+    db.execute(
+        """INSERT INTO email_outbox (recipient, subject, body, status, error, created_at, sent_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (recipient[:200], subject[:180], body[:8000], status, error, now_iso(), sent_at),
+    )
+    return status
+
+
+def create_notification(
+    db: sqlite3.Connection,
+    user_id: int,
+    kind: str,
+    title: str,
+    message: str,
+    href: str,
+    email_subject: str | None = None,
+) -> None:
+    user = db.execute(
+        "SELECT id, email FROM users WHERE id = ? AND active = 1", (user_id,)
+    ).fetchone()
+    if not user:
+        return
+    db.execute(
+        """INSERT INTO notifications (user_id, kind, title, message, href, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)""",
+        (user_id, kind[:30], title[:160], message[:500], href[:300], now_iso()),
+    )
+    subject = email_subject or f"PulseDesk: {title}"
+    body = f"{message}\\n\\nOpen PulseDesk to review this update: {href}"
+    deliver_email(db, user["email"], subject, body)
+
+
+def notify_roles(
+    db: sqlite3.Connection,
+    roles: tuple[str, ...],
+    kind: str,
+    title: str,
+    message: str,
+    href: str,
+    exclude_user_id: int | None = None,
+) -> None:
+    placeholders = ",".join("?" for _ in roles)
+    params: list[object] = list(roles)
+    query = f"SELECT id FROM users WHERE active = 1 AND role IN ({placeholders})"
+    if exclude_user_id is not None:
+        query += " AND id != ?"
+        params.append(exclude_user_id)
+    for row in db.execute(query, params).fetchall():
+        create_notification(db, row["id"], kind, title, message, href)
+
+
+def notify_ticket_owner(
+    db: sqlite3.Connection,
+    ticket: sqlite3.Row,
+    kind: str,
+    title: str,
+    message: str,
+) -> None:
+    owner_id = ticket["created_by"]
+    if owner_id:
+        create_notification(
+            db, owner_id, kind, title, message, f"/tickets/{ticket['id']}"
+        )
+
+
 def recommend_priority(title: str, description: str, category: str) -> tuple[str, str]:
     text = f"{title} {description}".lower()
     if any(word in text for word in ("outage", "breach", "ransomware", "server down", "all users", "data loss")):
@@ -180,6 +284,26 @@ def init_db() -> None:
                 actor_name TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL DEFAULT 'update',
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                href TEXT NOT NULL DEFAULT '/',
+                is_read INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS email_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipient TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'preview',
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                sent_at TEXT
+            );
             CREATE TABLE IF NOT EXISTS assets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 asset_tag TEXT NOT NULL UNIQUE,
@@ -210,6 +334,9 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_tickets_priority ON tickets(priority);
             CREATE INDEX IF NOT EXISTS idx_tickets_due ON tickets(due_at);
             CREATE INDEX IF NOT EXISTS idx_escalations_ticket ON ticket_escalations(ticket_id, id);
+            CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, id);
+            CREATE INDEX IF NOT EXISTS idx_activity_id ON activity(id);
+            CREATE INDEX IF NOT EXISTS idx_email_outbox_created ON email_outbox(created_at);
             """
         )
         ticket_columns = {row["name"] for row in db.execute("PRAGMA table_info(tickets)")}
@@ -226,6 +353,19 @@ def init_db() -> None:
                 )
         if db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0] == 0:
             seed_demo_data(db)
+        if db.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 0:
+            welcome = (
+                ("admin@pulsedesk.demo", "Control room ready", "Your team workspace and notification centre are ready.", "/notifications"),
+                ("agent@pulsedesk.demo", "Your incident feed is live", "New incident activity will appear in your workspace.", "/notifications"),
+                ("employee@pulsedesk.demo", "Support desk connected", "You can now submit requests and follow updates from IT.", "/my-tickets"),
+            )
+            for email, title, message, href in welcome:
+                user = db.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+                if user:
+                    db.execute(
+                        "INSERT INTO notifications (user_id, kind, title, message, href, created_at) VALUES (?, 'system', ?, ?, ?, ?)",
+                        (user["id"], title, message, href, now_iso()),
+                    )
 
 
 def seed_demo_data(db: sqlite3.Connection) -> None:
@@ -403,6 +543,11 @@ def my_tickets():
              now_iso(), now_iso(), due.replace(microsecond=0).isoformat(timespec="seconds"), g.user["id"]),
         )
         log_activity(db, "Employee request created", f"#{cursor.lastrowid} ? {title[:100]}", g.user["full_name"])
+        notify_roles(
+            db, ("Admin", "IT Agent"), "ticket", f"New request #{cursor.lastrowid}",
+            f"{g.user['full_name']} submitted: {title[:120]}",
+            f"/tickets/{cursor.lastrowid}", exclude_user_id=g.user["id"],
+        )
         db.commit()
         flash(f"Your request #{cursor.lastrowid} has been sent to IT.", "success")
         return redirect(url_for("my_tickets"))
@@ -441,10 +586,25 @@ def admin_users():
 def inject_globals():
     db = get_db()
     open_count = db.execute("SELECT COUNT(*) FROM tickets WHERE status != 'Resolved'").fetchone()[0]
+    user_id = g.user["id"] if g.get("user") is not None else None
+    unread_count = 0
+    latest_notifications = []
+    if user_id:
+        unread_count = db.execute(
+            "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND is_read = 0", (user_id,)
+        ).fetchone()[0]
+        latest_notifications = db.execute(
+            "SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 4", (user_id,)
+        ).fetchall()
+    activity_cursor = db.execute("SELECT COALESCE(MAX(id), 0) FROM activity").fetchone()[0]
     return {
         "current_user": g.get("user"),
         "csrf_token": session.get("_csrf_token", ""),
         "open_count_global": open_count,
+        "unread_notification_count": unread_count,
+        "latest_notifications": latest_notifications,
+        "activity_cursor": activity_cursor,
+        "smtp_configured": smtp_is_configured(),
         "now_string": now_iso(),
         "current_year": datetime.now().year,
         "weekday_label": datetime.now().strftime("%A").upper(),
@@ -503,7 +663,12 @@ def tickets_page():
             (title[:140], description[:2000], requester[:100], department, category, priority, assignee,
              now_iso(), now_iso(), due.replace(microsecond=0).isoformat(timespec="seconds")),
         )
-        log_activity(db, "Ticket created", f"#{cursor.lastrowid} ? {title[:100]} ? {priority} priority", g.user["full_name"])
+        log_activity(db, "Ticket created", f"#{cursor.lastrowid} · {title[:100]} · {priority} priority", g.user["full_name"])
+        notify_roles(
+            db, ("Admin", "IT Agent"), "ticket", f"Incident #{cursor.lastrowid} created",
+            f"{g.user['full_name']} logged: {title[:120]}",
+            f"/tickets/{cursor.lastrowid}", exclude_user_id=g.user["id"],
+        )
         db.commit()
         flash(f"Ticket #{cursor.lastrowid} created. Triage suggested {priority} priority.", "success")
         return redirect(url_for("ticket_detail", ticket_id=cursor.lastrowid))
@@ -552,6 +717,12 @@ def ticket_detail(ticket_id: int):
             (status, priority, assignee or "Unassigned", now_iso(), ticket_id),
         )
         log_activity(db, "Ticket updated", f"#{ticket_id} ? status: {status} ? priority: {priority}", g.user["full_name"])
+        if status != ticket["status"] or priority != ticket["priority"]:
+            notify_ticket_owner(
+                db, ticket, "status",
+                f"Request #{ticket_id} updated",
+                f"Your request ?{ticket['title']}? is now {status} with {priority} priority.",
+            )
         db.commit()
         flash(f"Ticket #{ticket_id} updated.", "success")
         return redirect(url_for("ticket_detail", ticket_id=ticket_id))
@@ -593,6 +764,17 @@ def escalate_ticket(ticket_id: int):
     db.execute("UPDATE tickets SET escalation_level = ?, updated_at = ? WHERE id = ?",
                (next_level, now_iso(), ticket_id))
     log_activity(db, "Incident escalated", f"#{ticket_id} ? Level {next_level} ? {target}", actor)
+    notify_roles(
+        db, ("Admin", "IT Agent"), "escalation",
+        f"Incident #{ticket_id} escalated",
+        f"{actor} escalated ?{ticket['title']}? to {target}. Reason: {reason[:240]}",
+        f"/tickets/{ticket_id}", exclude_user_id=g.user["id"],
+    )
+    notify_ticket_owner(
+        db, ticket, "escalation",
+        f"Your request #{ticket_id} needs additional support",
+        f"IT escalated your request to {target} for further investigation.",
+    )
     db.commit()
     flash(f"Incident #{ticket_id} escalated to {target}.", "success")
     return redirect(url_for("ticket_detail", ticket_id=ticket_id))
@@ -655,6 +837,100 @@ def article_detail(article_id: int):
     db.execute("UPDATE articles SET views = views + 1 WHERE id = ?", (article_id,))
     db.commit()
     return render_template("article_detail.html", active_page="knowledge", article=article)
+
+
+@app.route("/notifications")
+@login_required
+def notifications_page():
+    db = get_db()
+    notifications = db.execute(
+        "SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 100",
+        (g.user["id"],),
+    ).fetchall()
+    email_rows = []
+    if g.user["role"] == "Admin":
+        email_rows = db.execute(
+            "SELECT * FROM email_outbox ORDER BY id DESC LIMIT 40"
+        ).fetchall()
+    unread = db.execute(
+        "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND is_read = 0",
+        (g.user["id"],),
+    ).fetchone()[0]
+    return render_template(
+        "notifications.html", active_page="notifications",
+        notifications=notifications, email_rows=email_rows, unread=unread,
+        smtp_configured=smtp_is_configured(),
+    )
+
+
+@app.post("/notifications/<int:notification_id>/read")
+@login_required
+def mark_notification_read(notification_id: int):
+    db = get_db()
+    db.execute(
+        "UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?",
+        (notification_id, g.user["id"]),
+    )
+    db.commit()
+    destination = request.form.get("next", url_for("notifications_page"))
+    parsed = urlparse(destination)
+    if parsed.netloc or not destination.startswith("/") or destination.startswith("//"):
+        destination = url_for("notifications_page")
+    return redirect(destination)
+
+
+@app.post("/notifications/read-all")
+@login_required
+def mark_all_notifications_read():
+    db = get_db()
+    db.execute("UPDATE notifications SET is_read = 1 WHERE user_id = ?", (g.user["id"],))
+    db.commit()
+    flash("All notifications marked as read.", "success")
+    return redirect(url_for("notifications_page"))
+
+
+@app.route("/api/updates")
+@roles_required("Admin", "IT Agent")
+def live_updates_api():
+    db = get_db()
+    try:
+        after_id = max(0, int(request.args.get("after_id", "0")))
+    except ValueError:
+        after_id = 0
+    changes = db.execute(
+        "SELECT id, action, detail, actor, created_at FROM activity WHERE id > ? ORDER BY id ASC LIMIT 30",
+        (after_id,),
+    ).fetchall()
+    ticket_updates = db.execute(
+        """SELECT id, title, requester, assignee, priority, status, updated_at
+        FROM tickets ORDER BY updated_at DESC LIMIT 20"""
+    ).fetchall()
+    tickets = db.execute("SELECT * FROM tickets").fetchall()
+    breached = sum(ticket_sla(ticket) == "breached" for ticket in tickets)
+    unread = db.execute(
+        "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND is_read = 0",
+        (g.user["id"],),
+    ).fetchone()[0]
+    latest_notifications = db.execute(
+        "SELECT id, kind, title, message, href, is_read, created_at FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 4",
+        (g.user["id"],),
+    ).fetchall()
+    cursor = db.execute("SELECT COALESCE(MAX(id), 0) FROM activity").fetchone()[0]
+    return jsonify({
+        "activity": [dict(item) for item in changes],
+        "tickets": [dict(item) for item in ticket_updates],
+        "notifications": [dict(item) for item in latest_notifications],
+        "cursor": cursor,
+        "unread": unread,
+        "metrics": {
+            "total": len(tickets),
+            "open": sum(ticket["status"] != "Resolved" for ticket in tickets),
+            "breached": breached,
+            "resolved": sum(ticket["status"] == "Resolved" for ticket in tickets),
+            "sla_health": round(100 * (len(tickets) - breached) / max(1, len(tickets))),
+        },
+        "server_time": now_iso(),
+    })
 
 
 @app.route("/reports")

@@ -1,13 +1,16 @@
 import csv
 import gc
 import io
+import os
 import re
 import sqlite3
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
+import app as app_module
 from app import app, init_db
 
 
@@ -55,8 +58,8 @@ class PulseDeskTests(unittest.TestCase):
     def test_dashboard_loads_seeded_workspace(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Good to see you, Alex", response.data)
-        self.assertIn(b"Recent incidents", response.data)
+        self.assertIn(b"Make the signal", response.data)
+        self.assertIn(b"Incidents in motion", response.data)
 
     def test_login_page_and_invalid_password(self):
         client = app.test_client()
@@ -130,6 +133,146 @@ class PulseDeskTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row[0], "IT Agent")
         self.assertNotEqual(row[1], "TemporaryPass!2026")
+
+    def test_employee_request_notifies_it_and_records_email_previews(self):
+        employee = self.login_client("employee@pulsedesk.demo", "EmployeeDemo!2026")
+        with patch.dict(os.environ, {"PULSEDESK_SMTP_HOST": "", "PULSEDESK_SMTP_FROM": ""}):
+            response = self.post("/my-tickets", {
+                "title": "Payroll portal is unavailable",
+                "description": "The team cannot open the payroll portal.",
+                "department": "Finance",
+                "category": "Software",
+            }, client=employee, follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        with sqlite3.connect(self.db_path) as db:
+            notification_count = db.execute(
+                "SELECT COUNT(*) FROM notifications WHERE kind = 'ticket'"
+            ).fetchone()[0]
+            preview_count = db.execute(
+                "SELECT COUNT(*) FROM email_outbox WHERE status = 'preview'"
+            ).fetchone()[0]
+            recipients = {
+                row[0] for row in db.execute(
+                    "SELECT recipient FROM email_outbox WHERE status = 'preview'"
+                ).fetchall()
+            }
+        self.assertEqual(notification_count, 2)
+        self.assertEqual(preview_count, 2)
+        self.assertEqual(recipients, {"admin@pulsedesk.demo", "agent@pulsedesk.demo"})
+
+    def test_notification_centre_marks_only_the_current_users_alert_read(self):
+        response = self.client.get("/notifications")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Signal, not noise.", response.data)
+        with sqlite3.connect(self.db_path) as db:
+            admin_id = db.execute(
+                "SELECT id FROM users WHERE email = 'admin@pulsedesk.demo'"
+            ).fetchone()[0]
+            employee_id = db.execute(
+                "SELECT id FROM users WHERE email = 'employee@pulsedesk.demo'"
+            ).fetchone()[0]
+            admin_alert = db.execute(
+                "SELECT id FROM notifications WHERE user_id = ? ORDER BY id LIMIT 1",
+                (admin_id,),
+            ).fetchone()[0]
+        response = self.post(
+            f"/notifications/{admin_alert}/read",
+            {"next": "/notifications"},
+            follow_redirects=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        with sqlite3.connect(self.db_path) as db:
+            admin_read = db.execute(
+                "SELECT is_read FROM notifications WHERE id = ?", (admin_alert,)
+            ).fetchone()[0]
+            employee_unread = db.execute(
+                "SELECT is_read FROM notifications WHERE user_id = ? ORDER BY id LIMIT 1",
+                (employee_id,),
+            ).fetchone()[0]
+        self.assertEqual(admin_read, 1)
+        self.assertEqual(employee_unread, 0)
+
+    def test_ticket_status_change_notifies_employee_requester(self):
+        employee = self.login_client("employee@pulsedesk.demo", "EmployeeDemo!2026")
+        self.post("/my-tickets", {
+            "title": "Access to reporting workspace",
+            "description": "Please restore access to the quarterly workspace.",
+            "department": "Sales",
+            "category": "Access",
+        }, client=employee, follow_redirects=True)
+        with sqlite3.connect(self.db_path) as db:
+            ticket_id = db.execute(
+                "SELECT id FROM tickets WHERE title = ?",
+                ("Access to reporting workspace",),
+            ).fetchone()[0]
+            employee_id = db.execute(
+                "SELECT id FROM users WHERE email = 'employee@pulsedesk.demo'"
+            ).fetchone()[0]
+        response = self.post(f"/tickets/{ticket_id}", {
+            "status": "In Progress",
+            "priority": "Medium",
+            "assignee": "Jordan Lee",
+        }, follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        with sqlite3.connect(self.db_path) as db:
+            notification = db.execute(
+                "SELECT title, message FROM notifications WHERE user_id = ? AND kind = 'status' ORDER BY id DESC LIMIT 1",
+                (employee_id,),
+            ).fetchone()
+            email_status = db.execute(
+                "SELECT status FROM email_outbox WHERE recipient = ? ORDER BY id DESC LIMIT 1",
+                ("employee@pulsedesk.demo",),
+            ).fetchone()[0]
+        self.assertIn(str(ticket_id), notification[0])
+        self.assertIn("In Progress", notification[1])
+        self.assertEqual(email_status, "preview")
+
+    def test_live_updates_api_returns_new_activity_and_current_metrics(self):
+        with sqlite3.connect(self.db_path) as db:
+            cursor = db.execute("SELECT COALESCE(MAX(id), 0) FROM activity").fetchone()[0]
+            db.execute(
+                "INSERT INTO activity (action, detail, actor, created_at) VALUES (?, ?, ?, ?)",
+                ("Ticket updated", "#0042 - status: In Progress", "Jordan Lee", datetime.now().isoformat()),
+            )
+            db.commit()
+        response = self.client.get(f"/api/updates?after_id={cursor}")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["activity"][0]["action"], "Ticket updated")
+        self.assertEqual(payload["activity"][0]["actor"], "Jordan Lee")
+        self.assertEqual(payload["metrics"]["total"], 12)
+        self.assertIn("unread", payload)
+        self.assertIn("notifications", payload)
+        self.assertGreaterEqual(len(payload["notifications"]), 1)
+        self.assertGreater(payload["cursor"], cursor)
+
+    def test_smtp_delivery_sends_message_when_configured(self):
+        settings = {
+            "PULSEDESK_SMTP_HOST": "smtp.example.test",
+            "PULSEDESK_SMTP_PORT": "587",
+            "PULSEDESK_SMTP_FROM": "alerts@example.test",
+            "PULSEDESK_SMTP_USERNAME": "alerts",
+            "PULSEDESK_SMTP_PASSWORD": "test-placeholder",
+            "PULSEDESK_SMTP_STARTTLS": "1",
+        }
+        with patch.dict(os.environ, settings):
+            with patch.object(app_module.smtplib, "SMTP") as smtp_factory:
+                smtp_client = smtp_factory.return_value.__enter__.return_value
+                with app.app_context():
+                    db = app_module.get_db()
+                    status = app_module.deliver_email(
+                        db, "operator@example.test", "PulseDesk test", "Test alert body."
+                    )
+                    db.commit()
+                smtp_client.starttls.assert_called_once()
+                smtp_client.login.assert_called_once_with("alerts", "test-placeholder")
+                smtp_client.send_message.assert_called_once()
+        self.assertEqual(status, "sent")
+        with sqlite3.connect(self.db_path) as db:
+            row = db.execute(
+                "SELECT status, recipient FROM email_outbox ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(row, ("sent", "operator@example.test"))
 
     def test_sla_watchlist_only_returns_unresolved_overdue_tickets(self):
         response = self.client.get("/tickets?sla=breached")
