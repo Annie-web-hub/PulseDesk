@@ -1,0 +1,477 @@
+from __future__ import annotations
+
+import csv
+import io
+import os
+import re
+import secrets
+import sqlite3
+from html import escape
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from flask import Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, url_for
+
+BASE_DIR = Path(__file__).resolve().parent
+INSTANCE_DIR = BASE_DIR / "instance"
+INSTANCE_DIR.mkdir(exist_ok=True)
+DATABASE = Path(os.environ.get("PULSEDESK_DATABASE_PATH", INSTANCE_DIR / "pulsedesk.db"))
+
+app = Flask(__name__)
+secret_path = INSTANCE_DIR / ".secret"
+if not secret_path.exists():
+    secret_path.write_text(secrets.token_hex(32), encoding="utf-8")
+app.secret_key = os.environ.get("PULSEDESK_SECRET_KEY", secret_path.read_text(encoding="utf-8").strip())
+app.config.update(
+    DATABASE=str(DATABASE),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+)
+
+STATUSES = ("Open", "In Progress", "Waiting", "Resolved")
+PRIORITIES = ("Low", "Medium", "High", "Critical")
+CATEGORIES = ("Hardware", "Software", "Access", "Network", "Email", "Other")
+ASSET_STATUSES = ("In use", "In repair", "In stock", "Retired")
+
+
+def connect_db() -> sqlite3.Connection:
+    connection = sqlite3.connect(app.config["DATABASE"])
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def get_db() -> sqlite3.Connection:
+    if "db" not in g:
+        g.db = connect_db()
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(_error=None):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def now_iso() -> str:
+    return datetime.now().replace(microsecond=0).isoformat(timespec="seconds")
+
+
+def log_activity(db: sqlite3.Connection, action: str, detail: str, actor: str = "Alex Morgan") -> None:
+    db.execute(
+        "INSERT INTO activity (action, detail, actor, created_at) VALUES (?, ?, ?, ?)",
+        (action, detail, actor, now_iso()),
+    )
+
+
+def recommend_priority(title: str, description: str, category: str) -> tuple[str, str]:
+    text = f"{title} {description}".lower()
+    if any(word in text for word in ("outage", "breach", "ransomware", "server down", "all users", "data loss")):
+        return "Critical", "Potential service-wide or security incident detected."
+    if any(word in text for word in ("cannot work", "production blocked", "locked out", "network down", "urgent")):
+        return "High", "Work is blocked or a key service may be unavailable."
+    if category in ("Access", "Network") or any(word in text for word in ("intermittent", "slow", "permission")):
+        return "Medium", "A service or access issue needs investigation."
+    return "Low", "No urgent impact signals detected. Confirm impact with the requester."
+
+
+def init_db() -> None:
+    database_path = Path(app.config["DATABASE"])
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(database_path) as db:
+        db.row_factory = sqlite3.Row
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                requester TEXT NOT NULL,
+                department TEXT NOT NULL DEFAULT 'Operations',
+                category TEXT NOT NULL DEFAULT 'Other',
+                priority TEXT NOT NULL DEFAULT 'Medium',
+                status TEXT NOT NULL DEFAULT 'Open',
+                assignee TEXT NOT NULL DEFAULT 'Unassigned',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                due_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_tag TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                asset_type TEXT NOT NULL,
+                assigned_to TEXT NOT NULL DEFAULT 'Unassigned',
+                department TEXT NOT NULL DEFAULT 'Operations',
+                status TEXT NOT NULL DEFAULT 'In stock',
+                warranty_until TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS articles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                content TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                views INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
+            CREATE INDEX IF NOT EXISTS idx_tickets_priority ON tickets(priority);
+            CREATE INDEX IF NOT EXISTS idx_tickets_due ON tickets(due_at);
+            """
+        )
+        if db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0] == 0:
+            seed_demo_data(db)
+
+
+def seed_demo_data(db: sqlite3.Connection) -> None:
+    now = datetime.now().replace(microsecond=0)
+    demo_tickets = [
+        ("VPN connection drops during client calls", "The VPN disconnects several times an hour when connected from home. This is blocking client work.", "Maya Patel", "Sales", "Network", "High", "In Progress", "Jordan Lee", -2, 2),
+        ("New starter needs laptop and access", "Prepare a laptop, email account and standard application access for the new analyst starting Monday.", "Oliver Grant", "People", "Hardware", "Medium", "Open", "Priya Shah", -1, 22),
+        ("Shared finance drive unavailable", "The finance team cannot access the shared drive. Several users are affected and month-end work is blocked.", "Sophie Turner", "Finance", "Network", "Critical", "Open", "Jordan Lee", -1, -1),
+        ("Adobe licence renewal", "The design team needs three additional Creative Cloud seats before the next campaign.", "Noah Williams", "Marketing", "Software", "Low", "Waiting", "Priya Shah", -4, 46),
+        ("Multi-factor authentication reset", "A team member replaced their phone and cannot complete MFA verification.", "Ava Chen", "Operations", "Access", "Medium", "Resolved", "Alex Morgan", -5, -2),
+        ("Printer queue stuck on floor 3", "Print jobs remain in the queue and do not reach the shared printer.", "Leo Martin", "Finance", "Hardware", "Low", "Open", "Unassigned", -1, 30),
+        ("Suspicious sign-in notification", "A user received an unexpected sign-in alert from an unfamiliar location. Please investigate.", "Emma Wilson", "People", "Access", "High", "In Progress", "Alex Morgan", -1, 1),
+        ("CRM page loading very slowly", "Customer records take more than 20 seconds to load during peak hours.", "Isabella Brown", "Sales", "Software", "Medium", "Open", "Jordan Lee", -3, 8),
+        ("Meeting room display has no signal", "The HDMI display in meeting room Cedar is not detecting connected laptops.", "Ethan Davis", "Operations", "Hardware", "Low", "Resolved", "Priya Shah", -7, -1),
+        ("Email delivery delayed for whole team", "Several departments report delayed incoming email. Please check the mail service status.", "Grace Kim", "Marketing", "Email", "High", "Waiting", "Alex Morgan", -2, 1),
+        ("Request access to analytics workspace", "Please add read access to the quarterly reporting workspace.", "Lucas Reed", "Sales", "Access", "Low", "Resolved", "Jordan Lee", -8, -4),
+        ("Database server down in staging", "The staging database server is down and the release validation pipeline cannot run.", "Mia Thompson", "Engineering", "Network", "Critical", "In Progress", "Jordan Lee", -1, -1),
+    ]
+    for title, desc, requester, dept, category, priority, status, assignee, created_days, due_hours in demo_tickets:
+        created = now + timedelta(days=created_days)
+        db.execute(
+            """INSERT INTO tickets
+            (title, description, requester, department, category, priority, status, assignee, created_at, updated_at, due_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (title, desc, requester, dept, category, priority, status, assignee,
+             created.isoformat(timespec="seconds"), (created + timedelta(hours=3)).isoformat(timespec="seconds"),
+             (now + timedelta(hours=due_hours)).isoformat(timespec="seconds")),
+        )
+
+    demo_assets = [
+        ("AST-001", "MacBook Pro 14", "Laptop", "Maya Patel", "Sales", "In use", "2027-08-12"),
+        ("AST-002", "Dell Latitude 7440", "Laptop", "Oliver Grant", "People", "In use", "2027-09-02"),
+        ("AST-003", "ThinkPad X1 Carbon", "Laptop", "Jordan Lee", "IT", "In use", "2027-02-18"),
+        ("AST-004", "iPhone 15", "Mobile", "Sophie Turner", "Finance", "In use", "2027-01-10"),
+        ("AST-005", "Dell UltraSharp 27", "Monitor", "Unassigned", "Operations", "In stock", "2027-11-20"),
+        ("AST-006", "HP LaserJet Pro", "Printer", "Finance team", "Finance", "In repair", "2026-12-01"),
+        ("AST-007", "MacBook Air M3", "Laptop", "Noah Williams", "Marketing", "In use", "2028-01-15"),
+        ("AST-008", "iPad Air", "Tablet", "Meeting room Cedar", "Operations", "In stock", "2027-05-05"),
+    ]
+    db.executemany(
+        "INSERT INTO assets (asset_tag, name, asset_type, assigned_to, department, status, warranty_until) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        demo_assets,
+    )
+
+    articles = [
+        ("Reset your multi-factor authentication", "Access", "Regain account access when replacing a phone or losing an authenticator.", "## Before you begin\nMake sure you can access your company email or contact the IT desk.\n\n## Steps\n1. Open the identity portal and choose **Security info**.\n2. Remove the old authenticator method if the device is no longer available.\n3. Add the new authenticator app and scan the QR code.\n4. Complete the test notification before closing the page.\n\n**Still locked out?** Raise an Access ticket and include your preferred callback method.", 18),
+        ("Connect to the company VPN", "Network", "A quick checklist for connecting securely from outside the office.", "## Connection checklist\n1. Make sure your internet connection is stable.\n2. Open the approved VPN client.\n3. Sign in with your company account and approve the MFA request.\n4. Wait for the connected status before opening internal tools.\n\nIf the VPN repeatedly disconnects, note the time and network type in your ticket.", 32),
+        ("Prepare a laptop for a new starter", "Hardware", "The standard device setup checklist for employee onboarding.", "## Setup checklist\n- [ ] Confirm the approved device and asset tag.\n- [ ] Install operating system updates.\n- [ ] Enrol the device in endpoint management.\n- [ ] Enable disk encryption and screen lock.\n- [ ] Install approved business applications.\n- [ ] Verify email, collaboration and VPN access.\n- [ ] Record the assigned user in the asset register.", 24),
+        ("Report a suspicious sign-in", "Security", "What to do if you receive an unexpected account security alert.", "## Act promptly\n1. Do not approve an unexpected MFA prompt.\n2. Report the alert to IT or Security using the approved channel.\n3. Include the time, device and approximate location shown in the alert.\n4. Do not forward suspicious links or attachments to colleagues.\n\nThe security team will review sign-in logs and advise on next steps.", 41),
+    ]
+    for title, category, summary, content, views in articles:
+        db.execute(
+            "INSERT INTO articles (title, category, summary, content, updated_at, views) VALUES (?, ?, ?, ?, ?, ?)",
+            (title, category, summary, content, now.isoformat(timespec="seconds"), views),
+        )
+    db.execute(
+        "INSERT INTO activity (action, detail, actor, created_at) VALUES (?, ?, ?, ?)",
+        ("Workspace created", "PulseDesk demo workspace is ready to use.", "System", now.isoformat(timespec="seconds")),
+    )
+
+
+@app.template_filter("article_html")
+def article_html(value: str) -> str:
+    """Render a small Markdown subset after escaping all source text."""
+    output = []
+    in_list = False
+    for raw in str(value or "").splitlines():
+        line = escape(raw.strip())
+        if line.startswith("## "):
+            if in_list:
+                output.append("</ul>")
+                in_list = False
+            output.append(f"<h2>{line[3:]}</h2>")
+        elif line.startswith("- ") or re.match(r"^[0-9]+[.] ", line):
+            if not in_list:
+                output.append("<ul>")
+                in_list = True
+            content = re.sub(r"^(-|[0-9]+[.]) ", "", line).replace("**", "")
+            output.append(f"<li>{content}</li>")
+        elif line:
+            if in_list:
+                output.append("</ul>")
+                in_list = False
+            output.append(f"<p>{line.replace('**', '')}</p>")
+        elif in_list:
+            output.append("</ul>")
+            in_list = False
+    if in_list:
+        output.append("</ul>")
+    return "".join(output)
+
+
+@app.template_filter("timeago")
+def timeago(value: str) -> str:
+    try:
+        dt = datetime.fromisoformat(value)
+        delta = datetime.now() - dt
+        if delta.total_seconds() < 60:
+            return "Just now"
+        if delta.days:
+            return f"{delta.days}d ago"
+        if delta.seconds >= 3600:
+            return f"{delta.seconds // 3600}h ago"
+        return f"{max(1, delta.seconds // 60)}m ago"
+    except (TypeError, ValueError):
+        return value or "—"
+
+
+def ticket_sla(ticket: sqlite3.Row) -> str:
+    if ticket["status"] == "Resolved":
+        return "resolved"
+    try:
+        return "breached" if datetime.fromisoformat(ticket["due_at"]) < datetime.now() else "on-track"
+    except ValueError:
+        return "on-track"
+
+
+@app.context_processor
+def inject_globals():
+    db = get_db()
+    open_count = db.execute("SELECT COUNT(*) FROM tickets WHERE status != 'Resolved'").fetchone()[0]
+    return {
+        "open_count_global": open_count,
+        "now_string": now_iso(),
+        "current_year": datetime.now().year,
+        "weekday_label": datetime.now().strftime("%A").upper(),
+        "ticket_statuses": STATUSES,
+        "ticket_priorities": PRIORITIES,
+        "ticket_categories": CATEGORIES,
+        "asset_statuses": ASSET_STATUSES,
+    }
+
+
+@app.route("/")
+def dashboard():
+    db = get_db()
+    tickets = db.execute("SELECT * FROM tickets ORDER BY created_at DESC").fetchall()
+    open_count = sum(t["status"] in ("Open", "In Progress", "Waiting") for t in tickets)
+    breached = [t for t in tickets if ticket_sla(t) == "breached"]
+    critical = sum(t["priority"] == "Critical" and t["status"] != "Resolved" for t in tickets)
+    resolved = sum(t["status"] == "Resolved" for t in tickets)
+    active = sum(t["status"] == "In Progress" for t in tickets)
+    priorities = {p: sum(t["priority"] == p and t["status"] != "Resolved" for t in tickets) for p in PRIORITIES}
+    recent = db.execute("SELECT * FROM tickets ORDER BY created_at DESC LIMIT 6").fetchall()
+    activity = db.execute("SELECT * FROM activity ORDER BY id DESC LIMIT 6").fetchall()
+    assets = db.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+    return render_template(
+        "dashboard.html", active_page="overview", total=len(tickets), open_count=open_count,
+        breached=len(breached), critical=critical, resolved=resolved, active=active,
+        priorities=priorities, recent=recent, activity=activity, asset_count=assets,
+        sla_health=round(100 * (len(tickets) - len(breached)) / max(1, len(tickets))),
+    )
+
+
+@app.route("/tickets", methods=["GET", "POST"])
+def tickets_page():
+    db = get_db()
+    if request.method == "POST":
+        title = request.form.get("title", "").strip()
+        description = request.form.get("description", "").strip()
+        requester = request.form.get("requester", "").strip()
+        department = request.form.get("department", "Operations").strip()[:60] or "Operations"
+        category = request.form.get("category", "Other")
+        assignee = request.form.get("assignee", "Unassigned").strip()[:80] or "Unassigned"
+        if not title or not requester:
+            flash("Add a title and requester before creating the ticket.", "error")
+            return redirect(url_for("tickets_page"))
+        if category not in CATEGORIES:
+            category = "Other"
+        priority, reason = recommend_priority(title, description, category)
+        due = datetime.now() + timedelta(hours={"Critical": 2, "High": 8, "Medium": 24, "Low": 72}[priority])
+        cursor = db.execute(
+            """INSERT INTO tickets (title, description, requester, department, category, priority, status, assignee, created_at, updated_at, due_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'Open', ?, ?, ?, ?)""",
+            (title[:140], description[:2000], requester[:100], department, category, priority, assignee,
+             now_iso(), now_iso(), due.replace(microsecond=0).isoformat(timespec="seconds")),
+        )
+        log_activity(db, "Ticket created", f"#{cursor.lastrowid} · {title[:100]} · {priority} priority")
+        db.commit()
+        flash(f"Ticket #{cursor.lastrowid} created. Triage suggested {priority} priority.", "success")
+        return redirect(url_for("ticket_detail", ticket_id=cursor.lastrowid))
+
+    status = request.args.get("status", "")
+    priority = request.args.get("priority", "")
+    sla_filter = request.args.get("sla", "")
+    q = request.args.get("q", "").strip()[:100]
+    clauses, params = [], []
+    if status in STATUSES:
+        clauses.append("status = ?")
+        params.append(status)
+    if priority in PRIORITIES:
+        clauses.append("priority = ?")
+        params.append(priority)
+    if sla_filter == "breached":
+        clauses.append("status != 'Resolved' AND due_at < ?")
+        params.append(now_iso())
+    if q:
+        clauses.append("(title LIKE ? OR requester LIKE ? OR department LIKE ? OR CAST(id AS TEXT) = ?)")
+        params.extend([f"%{q}%", f"%{q}%", f"%{q}%", q.lstrip("#")])
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    tickets = db.execute(f"SELECT * FROM tickets{where} ORDER BY CASE priority WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 ELSE 4 END, created_at DESC", params).fetchall()
+    return render_template("tickets.html", active_page="tickets", tickets=tickets, filters={"status": status, "priority": priority, "sla": sla_filter, "q": q})
+
+
+@app.route("/tickets/<int:ticket_id>", methods=["GET", "POST"])
+def ticket_detail(ticket_id: int):
+    db = get_db()
+    ticket = db.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+    if ticket is None:
+        abort(404)
+    if request.method == "POST":
+        status = request.form.get("status", ticket["status"])
+        priority = request.form.get("priority", ticket["priority"])
+        assignee = request.form.get("assignee", ticket["assignee"]).strip()[:80]
+        if status not in STATUSES or priority not in PRIORITIES:
+            abort(400)
+        db.execute(
+            "UPDATE tickets SET status = ?, priority = ?, assignee = ?, updated_at = ? WHERE id = ?",
+            (status, priority, assignee or "Unassigned", now_iso(), ticket_id),
+        )
+        log_activity(db, "Ticket updated", f"#{ticket_id} · status: {status} · priority: {priority}")
+        db.commit()
+        flash(f"Ticket #{ticket_id} updated.", "success")
+        return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+    suggested_priority, triage_reason = recommend_priority(ticket["title"], ticket["description"], ticket["category"])
+    return render_template("ticket_detail.html", active_page="tickets", ticket=ticket,
+                           sla=ticket_sla(ticket), suggested_priority=suggested_priority, triage_reason=triage_reason)
+
+
+@app.route("/assets", methods=["GET", "POST"])
+def assets_page():
+    db = get_db()
+    if request.method == "POST":
+        tag = request.form.get("asset_tag", "").strip().upper()[:30]
+        name = request.form.get("name", "").strip()
+        asset_type = request.form.get("asset_type", "Laptop").strip()[:40]
+        assigned = request.form.get("assigned_to", "Unassigned").strip()[:100] or "Unassigned"
+        department = request.form.get("department", "Operations").strip()[:60] or "Operations"
+        status = request.form.get("status", "In stock")
+        warranty = request.form.get("warranty_until", "").strip()
+        if not tag or not name or status not in ASSET_STATUSES:
+            flash("Enter an asset tag and name, and choose a valid status.", "error")
+        else:
+            try:
+                db.execute(
+                    "INSERT INTO assets (asset_tag, name, asset_type, assigned_to, department, status, warranty_until) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (tag, name[:100], asset_type, assigned, department, status, warranty),
+                )
+                log_activity(db, "Asset registered", f"{tag} · {name[:80]}")
+                db.commit()
+                flash(f"Asset {tag} added to the inventory.", "success")
+            except sqlite3.IntegrityError:
+                flash(f"Asset tag {tag} already exists.", "error")
+        return redirect(url_for("assets_page"))
+    q = request.args.get("q", "").strip()[:100]
+    assets = db.execute(
+        "SELECT * FROM assets WHERE asset_tag LIKE ? OR name LIKE ? OR assigned_to LIKE ? ORDER BY id DESC",
+        (f"%{q}%", f"%{q}%", f"%{q}%"),
+    ).fetchall()
+    counts = {s: db.execute("SELECT COUNT(*) FROM assets WHERE status = ?", (s,)).fetchone()[0] for s in ASSET_STATUSES}
+    return render_template("assets.html", active_page="assets", assets=assets, counts=counts, q=q)
+
+
+@app.route("/knowledge")
+def knowledge_page():
+    db = get_db()
+    q = request.args.get("q", "").strip()[:100]
+    articles = db.execute(
+        "SELECT * FROM articles WHERE title LIKE ? OR summary LIKE ? OR category LIKE ? ORDER BY views DESC",
+        (f"%{q}%", f"%{q}%", f"%{q}%"),
+    ).fetchall()
+    return render_template("knowledge.html", active_page="knowledge", articles=articles, q=q)
+
+
+@app.route("/knowledge/<int:article_id>")
+def article_detail(article_id: int):
+    db = get_db()
+    article = db.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone()
+    if article is None:
+        abort(404)
+    db.execute("UPDATE articles SET views = views + 1 WHERE id = ?", (article_id,))
+    db.commit()
+    return render_template("article_detail.html", active_page="knowledge", article=article)
+
+
+@app.route("/reports")
+def reports_page():
+    db = get_db()
+    total = db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
+    status_rows = db.execute("SELECT status, COUNT(*) AS total FROM tickets GROUP BY status").fetchall()
+    priority_rows = db.execute("SELECT priority, COUNT(*) AS total FROM tickets GROUP BY priority").fetchall()
+    category_rows = db.execute("SELECT category, COUNT(*) AS total FROM tickets GROUP BY category ORDER BY total DESC").fetchall()
+    recent = db.execute("SELECT * FROM tickets ORDER BY created_at DESC LIMIT 8").fetchall()
+    resolved = db.execute("SELECT COUNT(*) FROM tickets WHERE status = 'Resolved'").fetchone()[0]
+    breached = sum(ticket_sla(t) == "breached" for t in db.execute("SELECT * FROM tickets").fetchall())
+    return render_template("reports.html", active_page="reports", total=total,
+                           status_rows=status_rows, priority_rows=priority_rows, category_rows=category_rows,
+                           recent=recent, resolved=resolved, breached=breached,
+                           resolution_rate=round(resolved * 100 / max(1, total)))
+
+
+@app.route("/export/tickets.csv")
+def export_tickets():
+    db = get_db()
+    rows = db.execute("SELECT id, title, requester, department, category, priority, status, assignee, created_at, due_at FROM tickets ORDER BY id").fetchall()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Ticket ID", "Title", "Requester", "Department", "Category", "Priority", "Status", "Assignee", "Created", "SLA due"])
+    writer.writerows([tuple(row) for row in rows])
+    response = make_response("\ufeff" + output.getvalue())
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = "attachment; filename=pulsedesk-tickets.csv"
+    return response
+
+
+@app.route("/api/metrics")
+def metrics_api():
+    db = get_db()
+    tickets = db.execute("SELECT * FROM tickets").fetchall()
+    return jsonify({
+        "total": len(tickets),
+        "open": sum(t["status"] != "Resolved" for t in tickets),
+        "breached": sum(ticket_sla(t) == "breached" for t in tickets),
+        "sla_health": round(100 * (len(tickets) - sum(ticket_sla(t) == "breached" for t in tickets)) / max(1, len(tickets))),
+        "by_status": {status: sum(t["status"] == status for t in tickets) for status in STATUSES},
+        "by_priority": {priority: sum(t["priority"] == priority for t in tickets) for priority in PRIORITIES},
+    })
+
+
+@app.errorhandler(404)
+def not_found(_error):
+    return render_template("error.html", active_page=""), 404
+
+
+@app.errorhandler(413)
+def too_large(_error):
+    flash("That submission is too large. Please keep attachments under 2 MB.", "error")
+    return redirect(request.referrer or url_for("dashboard"))
+
+
+init_db()
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "5000")), debug=os.environ.get("FLASK_DEBUG") == "1")
