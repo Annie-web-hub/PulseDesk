@@ -272,7 +272,8 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL,
                 due_at TEXT NOT NULL,
                 created_by INTEGER REFERENCES users(id),
-                escalation_level INTEGER NOT NULL DEFAULT 0
+                escalation_level INTEGER NOT NULL DEFAULT 0,
+                resolved_at TEXT
             );
             CREATE TABLE IF NOT EXISTS ticket_escalations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -344,6 +345,8 @@ def init_db() -> None:
             db.execute("ALTER TABLE tickets ADD COLUMN created_by INTEGER REFERENCES users(id)")
         if "escalation_level" not in ticket_columns:
             db.execute("ALTER TABLE tickets ADD COLUMN escalation_level INTEGER NOT NULL DEFAULT 0")
+        if "resolved_at" not in ticket_columns:
+            db.execute("ALTER TABLE tickets ADD COLUMN resolved_at TEXT")
 
         if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             for email, full_name, role, password in DEMO_ACCOUNTS:
@@ -353,6 +356,10 @@ def init_db() -> None:
                 )
         if db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0] == 0:
             seed_demo_data(db)
+        # Backfill historical demo/legacy resolved rows without replacing any ticket data.
+        db.execute(
+            "UPDATE tickets SET resolved_at = updated_at WHERE status = 'Resolved' AND resolved_at IS NULL"
+        )
         if db.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 0:
             welcome = (
                 ("admin@pulsedesk.demo", "Control room ready", "Your team workspace and notification centre are ready.", "/notifications"),
@@ -712,9 +719,14 @@ def ticket_detail(ticket_id: int):
         assignee = request.form.get("assignee", ticket["assignee"]).strip()[:80]
         if status not in STATUSES or priority not in PRIORITIES:
             abort(400)
+        updated_at = now_iso()
+        if status == "Resolved":
+            resolved_at = ticket["resolved_at"] or updated_at
+        else:
+            resolved_at = None
         db.execute(
-            "UPDATE tickets SET status = ?, priority = ?, assignee = ?, updated_at = ? WHERE id = ?",
-            (status, priority, assignee or "Unassigned", now_iso(), ticket_id),
+            "UPDATE tickets SET status = ?, priority = ?, assignee = ?, updated_at = ?, resolved_at = ? WHERE id = ?",
+            (status, priority, assignee or "Unassigned", updated_at, resolved_at, ticket_id),
         )
         log_activity(db, "Ticket updated", f"#{ticket_id} ? status: {status} ? priority: {priority}", g.user["full_name"])
         if status != ticket["status"] or priority != ticket["priority"]:
@@ -933,21 +945,235 @@ def live_updates_api():
     })
 
 
+def build_analytics(days: int = 30) -> dict:
+    """Build a date-windowed analytics snapshot from the live incident register."""
+    if days not in (7, 30, 90, 365):
+        days = 30
+
+    now = datetime.now().replace(microsecond=0)
+    if days in (7, 30):
+        first_day = now.date() - timedelta(days=days - 1)
+        bucket_starts = [
+            datetime.combine(first_day + timedelta(days=index), datetime.min.time())
+            for index in range(days)
+        ]
+        bucket_kind = "daily"
+        labels = [item.strftime("%d %b") for item in bucket_starts]
+    elif days == 90:
+        current_monday = now.date() - timedelta(days=now.weekday())
+        first_day = current_monday - timedelta(weeks=12)
+        bucket_starts = [
+            datetime.combine(first_day + timedelta(weeks=index), datetime.min.time())
+            for index in range(13)
+        ]
+        bucket_kind = "weekly"
+        labels = [item.strftime("%d %b") for item in bucket_starts]
+    else:
+        current_month = now.year * 12 + now.month - 1
+        first_month = current_month - 11
+        bucket_starts = []
+        for index in range(12):
+            month_index = first_month + index
+            year, month_zero = divmod(month_index, 12)
+            bucket_starts.append(datetime(year, month_zero + 1, 1))
+        bucket_kind = "monthly"
+        labels = [item.strftime("%b %y") for item in bucket_starts]
+
+    period_start = bucket_starts[0]
+    previous_duration = now - period_start
+    previous_start = period_start - previous_duration
+    tickets = get_db().execute("SELECT * FROM tickets ORDER BY created_at DESC").fetchall()
+
+    trend = [
+        {"label": labels[index], "opened": 0, "resolved": 0}
+        for index in range(len(bucket_starts))
+    ]
+    category_counts = {category: 0 for category in CATEGORIES}
+    priority_counts = {priority: 0 for priority in PRIORITIES}
+    team = {}
+    opened = []
+    resolved_in_period = []
+    previous_opened = 0
+    previous_resolved = 0
+    overdue_now = 0
+
+    def parse_timestamp(value: str | None) -> datetime | None:
+        try:
+            return datetime.fromisoformat(value) if value else None
+        except (TypeError, ValueError):
+            return None
+
+    def bucket_for(moment: datetime) -> int | None:
+        if bucket_kind == "daily":
+            index = (moment.date() - bucket_starts[0].date()).days
+        elif bucket_kind == "weekly":
+            index = (moment.date() - bucket_starts[0].date()).days // 7
+        else:
+            index = (moment.year * 12 + moment.month - 1) - (
+                bucket_starts[0].year * 12 + bucket_starts[0].month - 1
+            )
+        return index if 0 <= index < len(trend) else None
+
+    for ticket in tickets:
+        created_at = parse_timestamp(ticket["created_at"])
+        updated_at = parse_timestamp(ticket["updated_at"]) or created_at
+        resolved_at = parse_timestamp(ticket["resolved_at"]) if ticket["status"] == "Resolved" else None
+        resolved_at = resolved_at or (updated_at if ticket["status"] == "Resolved" else None)
+        created_in_period = bool(created_at and period_start <= created_at <= now)
+        resolved_in_window = bool(
+            resolved_at and period_start <= resolved_at <= now
+        )
+        created_before_period = bool(
+            created_at and previous_start <= created_at < period_start
+        )
+        resolved_before_period = bool(
+            resolved_at and previous_start <= resolved_at < period_start
+        )
+
+        ticket_is_overdue = ticket_sla(ticket) == "breached"
+        if ticket_is_overdue:
+            overdue_now += 1
+        if created_in_period:
+            opened.append(ticket)
+            category_counts[ticket["category"]] = category_counts.get(ticket["category"], 0) + 1
+            priority_counts[ticket["priority"]] = priority_counts.get(ticket["priority"], 0) + 1
+            index = bucket_for(created_at)
+            if index is not None:
+                trend[index]["opened"] += 1
+        if resolved_in_window:
+            resolved_in_period.append(ticket)
+            index = bucket_for(resolved_at)
+            if index is not None:
+                trend[index]["resolved"] += 1
+        if created_before_period:
+            previous_opened += 1
+        if resolved_before_period:
+            previous_resolved += 1
+
+        owner = (ticket["assignee"] or "Unassigned").strip() or "Unassigned"
+        metrics = team.setdefault(owner, {
+            "assignee": owner, "assigned": 0, "active": 0, "resolved": 0,
+            "overdue": 0, "resolution_hours_total": 0.0, "resolution_samples": 0,
+        })
+        if created_in_period:
+            metrics["assigned"] += 1
+        if ticket["status"] != "Resolved":
+            metrics["active"] += 1
+        if ticket_is_overdue:
+            metrics["overdue"] += 1
+        if resolved_in_window:
+            metrics["resolved"] += 1
+            if created_at and resolved_at and resolved_at >= created_at:
+                metrics["resolution_hours_total"] += (resolved_at - created_at).total_seconds() / 3600
+                metrics["resolution_samples"] += 1
+
+    total = len(tickets)
+    resolved_total = sum(ticket["status"] == "Resolved" for ticket in tickets)
+    status_rows = [
+        {"status": status, "total": sum(ticket["status"] == status for ticket in tickets)}
+        for status in STATUSES
+    ]
+    category_rows = [
+        {"category": category, "total": count}
+        for category, count in sorted(category_counts.items(), key=lambda item: (-item[1], item[0]))
+        if count
+    ]
+    priority_rows = [
+        {"priority": priority, "total": priority_counts[priority]}
+        for priority in PRIORITIES
+    ]
+    team_rows = []
+    for metrics in team.values():
+        samples = metrics.pop("resolution_samples")
+        hours_total = metrics.pop("resolution_hours_total")
+        metrics["avg_resolution_hours"] = round(hours_total / samples, 1) if samples else None
+        team_rows.append(metrics)
+    team_rows.sort(key=lambda item: (-item["active"], -item["resolved"], item["assignee"].lower()))
+
+    current_opened = len(opened)
+    current_resolved = len(resolved_in_period)
+
+    def percentage_change(current: int, previous: int) -> float | None:
+        if previous == 0:
+            return 100.0 if current else 0.0
+        return round((current - previous) * 100 / previous, 1)
+
+    return {
+        "days": days,
+        "period_label": f"{period_start:%d %b %Y} — {now:%d %b %Y}",
+        "bucket_kind": bucket_kind,
+        "trend": trend,
+        "total": total,
+        "opened": current_opened,
+        "resolved": current_resolved,
+        "resolved_total": resolved_total,
+        "active": total - resolved_total,
+        "overdue": overdue_now,
+        "resolution_rate": round(resolved_total * 100 / max(1, total)),
+        "sla_compliance": round(((total - resolved_total - overdue_now) * 100) / max(1, total - resolved_total)) if total > resolved_total else 100,
+        "category_rows": category_rows,
+        "priority_rows": priority_rows,
+        "status_rows": status_rows,
+        "team_rows": team_rows,
+        "changes": {
+            "opened": percentage_change(current_opened, previous_opened),
+            "resolved": percentage_change(current_resolved, previous_resolved),
+        },
+    }
+
+
 @app.route("/reports")
 @roles_required("Admin", "IT Agent")
 def reports_page():
-    db = get_db()
-    total = db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
-    status_rows = db.execute("SELECT status, COUNT(*) AS total FROM tickets GROUP BY status").fetchall()
-    priority_rows = db.execute("SELECT priority, COUNT(*) AS total FROM tickets GROUP BY priority").fetchall()
-    category_rows = db.execute("SELECT category, COUNT(*) AS total FROM tickets GROUP BY category ORDER BY total DESC").fetchall()
-    recent = db.execute("SELECT * FROM tickets ORDER BY created_at DESC LIMIT 8").fetchall()
-    resolved = db.execute("SELECT COUNT(*) FROM tickets WHERE status = 'Resolved'").fetchone()[0]
-    breached = sum(ticket_sla(t) == "breached" for t in db.execute("SELECT * FROM tickets").fetchall())
-    return render_template("reports.html", active_page="reports", total=total,
-                           status_rows=status_rows, priority_rows=priority_rows, category_rows=category_rows,
-                           recent=recent, resolved=resolved, breached=breached,
-                           resolution_rate=round(resolved * 100 / max(1, total)))
+    try:
+        days = int(request.args.get("days", "30"))
+    except (TypeError, ValueError):
+        days = 30
+    if days not in (7, 30, 90, 365):
+        days = 30
+    analytics = build_analytics(days)
+    recent = get_db().execute("SELECT * FROM tickets ORDER BY created_at DESC LIMIT 8").fetchall()
+    return render_template(
+        "reports.html", active_page="reports", analytics=analytics, recent=recent
+    )
+
+
+@app.route("/api/analytics")
+@roles_required("Admin", "IT Agent")
+def analytics_api():
+    try:
+        days = int(request.args.get("days", "30"))
+    except (TypeError, ValueError):
+        days = 30
+    return jsonify(build_analytics(days))
+
+
+@app.route("/export/analytics.csv")
+@roles_required("Admin", "IT Agent")
+def export_analytics():
+    try:
+        days = int(request.args.get("days", "30"))
+    except (TypeError, ValueError):
+        days = 30
+    analytics = build_analytics(days)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["PulseDesk analytics", analytics["period_label"]])
+    writer.writerow([])
+    writer.writerow(["Team member", "Incidents assigned in period", "Active workload", "Resolved in period", "Overdue active", "Average resolution hours"])
+    for row in analytics["team_rows"]:
+        writer.writerow([
+            row["assignee"], row["assigned"], row["active"], row["resolved"],
+            row["overdue"], row["avg_resolution_hours"] if row["avg_resolution_hours"] is not None else "",
+        ])
+    writer.writerow([])
+    writer.writerow(["Bucket", "Opened", "Resolved"])
+    for row in analytics["trend"]:
+        writer.writerow([row["label"], row["opened"], row["resolved"]])
+    response = make_response("\ufeff" + output.getvalue())
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = f"attachment; filename=pulsedesk-analytics-{days}d.csv"
+    return response
 
 
 @app.route("/export/tickets.csv")

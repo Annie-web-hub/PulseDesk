@@ -6,6 +6,8 @@ PulseDesk is a portfolio project demonstrating how an IT team can manage inciden
 
 ![PulseDesk 3.0 command dashboard](docs/pulsedesk-dashboard-preview.png)
 
+![PulseDesk analytics suite](docs/pulsedesk-analytics-preview.png)
+
 [View the new sign-in design](docs/pulsedesk-login-preview.png)
 
 ## Product capabilities
@@ -19,14 +21,24 @@ PulseDesk is a portfolio project demonstrating how an IT team can manage inciden
 - **SLA monitoring:** identify overdue incidents and surface an SLA watchlist.
 - **Asset inventory:** register devices, track assignment, department, repair state and warranty.
 - **Knowledge base:** searchable IT help articles and troubleshooting guides.
-- **Analytics & reporting:** view workload by status, severity and category, plus resolution rate and SLA health.
-- **CSV export:** download an Excel-friendly UTF-8 incident register.
-- **REST endpoint:** expose operational metrics as JSON at `/api/metrics`.
+- **Analytics & reporting:** explore live incident intake/resolution trends, priority mix, current backlog, SLA compliance and team workload/performance.
+- **Reporting windows:** filter trends to 7-day or 30-day daily buckets, 90-day weekly buckets, or a 12-month monthly view.
+- **Team performance:** compare assigned volume, active workload, resolved incidents, overdue items and average resolution hours by current assignee.
+- **CSV exports:** download the incident register or a period-specific analytics report in Excel-friendly UTF-8 format.
+- **REST endpoints:** access operational metrics at `/api/metrics` and windowed reporting data at `/api/analytics?days=30`.
 - **CSRF protection:** validate tokens on state-changing form submissions.
 - **Notification centre:** personal in-app inbox, unread counts, read state and a compact notification popover.
 - **Email alerts:** SMTP delivery for new requests, incident status changes and escalations; delivery outcomes are recorded in an admin-visible outbox.
 - **Live updates:** protected polling API refreshes activity, notification counts, SLA metrics and visible incident rows every eight seconds.
 - **Distinctive operations UI:** a dark control-room interface with live telemetry, signal stream and responsive layouts.
+
+## Analytics definitions
+
+- **Incidents received** are records whose `created_at` timestamp falls inside the selected window. Trend buckets are daily (7/30 days), weekly (90 days) or monthly (12 months).
+- **Resolved in period** uses the dedicated `resolved_at` timestamp. Reopening an incident clears it; resolving it again records a new timestamp. Existing resolved records are backfilled from their previous update timestamp during the additive migration.
+- **Active and overdue** counts reflect the current register, not just tickets created inside the selected window. SLA compliance is measured against the active queue; resolved incidents are excluded from its denominator.
+- **Team attribution** uses each incident's current assignee because this demo does not yet keep a reassignment history. “Assigned in period” counts tickets created in the selected window by their current assignee.
+- **Average resolution hours** is calculated from `created_at` to `resolved_at` for incidents resolved during the window. It is shown only where at least one resolution sample exists.
 
 ## Demo accounts
 
@@ -111,13 +123,15 @@ pulsedesk/
 ├── app.py                  # Flask routes, auth, permissions and data logic
 ├── instance/               # Local SQLite database and generated secret (ignored)
 ├── static/
-│   ├── app.js              # Modal, navigation and interaction behaviour
+│   ├── app.js              # Modal, navigation and live update behaviour
+│   ├── analytics.js        # Interactive reporting charts
 │   └── style.css           # Responsive product UI
 ├── templates/              # Jinja screens and reusable layout
 ├── tests/
 │   └── test_app.py         # Authentication and workflow integration tests
 ├── docs/
 │   ├── pulsedesk-dashboard-preview.png
+│   ├── pulsedesk-analytics-preview.png
 │   └── pulsedesk-login-preview.png
 ├── .gitignore
 ├── requirements.txt
@@ -126,7 +140,7 @@ pulsedesk/
 
 ## Engineering and security notes
 
-- Existing PulseDesk databases receive additive schema migrations for accounts, ticket ownership and escalation history; existing ticket and asset rows are retained.
+- Existing PulseDesk databases receive additive schema migrations for accounts, ticket ownership, escalation history and incident resolution timestamps; existing ticket and asset rows are retained.
 - SQL statements use parameter binding for user-supplied values.
 - Passwords are hashed with Werkzeug's password hashing helpers; plaintext passwords are never stored.
 - Session cookies are HTTP-only and use SameSite=Lax. Set `PULSEDESK_SECURE_COOKIES=1` behind HTTPS to enable the Secure cookie flag. CSRF tokens are checked for POST requests.

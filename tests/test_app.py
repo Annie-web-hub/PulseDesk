@@ -6,7 +6,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -313,6 +313,41 @@ class PulseDeskTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Resolved", response.data)
         self.assertIn(b"Maya Support", response.data)
+        with sqlite3.connect(self.db_path) as db:
+            first_resolved_at = db.execute(
+                "SELECT resolved_at FROM tickets WHERE id = 1"
+            ).fetchone()[0]
+        self.assertTrue(first_resolved_at)
+
+        # A later priority edit must not move the actual resolution timestamp.
+        self.post("/tickets/1", {
+            "status": "Resolved", "priority": "Low", "assignee": "Maya Support",
+        }, follow_redirects=True)
+        with sqlite3.connect(self.db_path) as db:
+            unchanged_resolved_at = db.execute(
+                "SELECT resolved_at FROM tickets WHERE id = 1"
+            ).fetchone()[0]
+        self.assertEqual(unchanged_resolved_at, first_resolved_at)
+
+        # Reopening clears the resolution timestamp so the next closure is measured afresh.
+        self.post("/tickets/1", {
+            "status": "In Progress", "priority": "Low", "assignee": "Maya Support",
+        }, follow_redirects=True)
+        with sqlite3.connect(self.db_path) as db:
+            reopened = db.execute(
+                "SELECT resolved_at FROM tickets WHERE id = 1"
+            ).fetchone()[0]
+        self.assertIsNone(reopened)
+
+    def test_legacy_resolved_tickets_receive_a_resolution_timestamp(self):
+        with sqlite3.connect(self.db_path) as db:
+            rows = db.execute(
+                "SELECT COUNT(*) FROM tickets WHERE status = 'Resolved' AND resolved_at IS NOT NULL"
+            ).fetchone()[0]
+            total = db.execute(
+                "SELECT COUNT(*) FROM tickets WHERE status = 'Resolved'"
+            ).fetchone()[0]
+        self.assertEqual(rows, total)
 
     def test_invalid_ticket_workflow_values_are_rejected(self):
         response = self.post("/tickets/1", {
@@ -396,6 +431,70 @@ class PulseDeskTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Connect to the company VPN", response.data)
         self.assertNotIn(b"Prepare a laptop", response.data)
+
+    def test_analytics_page_renders_period_filter_charts_and_team_table(self):
+        response = self.client.get("/reports?days=7")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Know where the work goes.", response.data)
+        self.assertIn(b'id="incident-trend-chart"', response.data)
+        self.assertIn(b'id="priority-donut-chart"', response.data)
+        self.assertIn(b'id="team-capacity-chart"', response.data)
+        self.assertIn(b"Ownership & delivery", response.data)
+        self.assertIn(b'value="7" selected', response.data)
+        self.assertIn(b"analytics.js", response.data)
+
+    def test_analytics_api_returns_real_bucketed_and_team_metrics(self):
+        with sqlite3.connect(self.db_path) as db:
+            now = datetime.now().replace(microsecond=0)
+            created = now.isoformat(timespec="seconds")
+            due = (now + timedelta(days=2)).isoformat(timespec="seconds")
+            db.execute(
+                """INSERT INTO tickets
+                (title, description, requester, department, category, priority, status, assignee,
+                 created_at, updated_at, due_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("Analytics test incident", "Created for analytics coverage.", "Test User",
+                 "Engineering", "Software", "High", "Resolved", "Jordan Lee",
+                 created, created, due),
+            )
+            db.commit()
+        response = self.client.get("/api/analytics?days=7")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["days"], 7)
+        self.assertEqual(payload["bucket_kind"], "daily")
+        expected_sla = round((payload["active"] - payload["overdue"]) * 100 / max(1, payload["active"])) if payload["active"] else 100
+        self.assertEqual(payload["sla_compliance"], expected_sla)
+        self.assertEqual(len(payload["trend"]), 7)
+        self.assertEqual(sum(row["opened"] for row in payload["trend"]), payload["opened"])
+        self.assertEqual(sum(row["resolved"] for row in payload["trend"]), payload["resolved"])
+        jordan = next(row for row in payload["team_rows"] if row["assignee"] == "Jordan Lee")
+        self.assertGreaterEqual(jordan["assigned"], 1)
+        self.assertGreaterEqual(jordan["resolved"], 1)
+        self.assertIsNotNone(jordan["avg_resolution_hours"])
+        self.assertIn("Unassigned", {row["assignee"] for row in payload["team_rows"]})
+
+    def test_analytics_periods_are_validated_and_csv_export_is_scoped(self):
+        defaulted = self.client.get("/api/analytics?days=999")
+        self.assertEqual(defaulted.status_code, 200)
+        self.assertEqual(defaulted.get_json()["days"], 30)
+        invalid = self.client.get("/api/analytics?days=not-a-number")
+        self.assertEqual(invalid.status_code, 200)
+        self.assertEqual(invalid.get_json()["days"], 30)
+        monthly = self.client.get("/api/analytics?days=365")
+        self.assertEqual(monthly.get_json()["bucket_kind"], "monthly")
+        self.assertEqual(len(monthly.get_json()["trend"]), 12)
+        export = self.client.get("/export/analytics.csv?days=7")
+        self.assertEqual(export.status_code, 200)
+        self.assertIn("pulsedesk-analytics-7d.csv", export.headers["Content-Disposition"])
+        self.assertIn("Team member", export.get_data(as_text=True))
+        self.assertIn("Bucket", export.get_data(as_text=True))
+
+    def test_employee_cannot_access_analytics_or_analytics_export(self):
+        employee = self.login_client("employee@pulsedesk.demo", "EmployeeDemo!2026")
+        self.assertEqual(employee.get("/reports").status_code, 403)
+        self.assertEqual(employee.get("/api/analytics").status_code, 403)
+        self.assertEqual(employee.get("/export/analytics.csv").status_code, 403)
 
     def test_csv_export_contains_headers_and_ticket_rows(self):
         response = self.client.get("/export/tickets.csv")
