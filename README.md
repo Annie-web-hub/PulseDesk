@@ -2,31 +2,59 @@
 
 **An IT Operations & Service Desk Management Platform** built with Python, Flask, SQLite, HTML, CSS and JavaScript.
 
-PulseDesk is a portfolio project that demonstrates practical IT operations workflows in a responsive, self-contained web application. The included Northstar Studio workspace is populated with fictional sample data so the product is useful immediately after setup.
+PulseDesk is a portfolio project demonstrating how an IT team can manage incidents, people, company assets, service levels and escalation workflows in one responsive workspace. The Northstar Studio demo environment is seeded with fictional records so the app is ready to explore after setup.
 
 ![PulseDesk](docs/pulsedesk-preview.png)
 
 ## Product capabilities
 
-- **Incident management:** create, search and filter incidents; assign owners; manage priorities and workflow status.
-- **Rule-based smart triage:** suggest a priority and response target from incident keywords and category.
-- **SLA monitoring:** compare ticket due times with current status and surface overdue work.
-- **Asset inventory:** register devices, assign them to departments and users, and track stock/repair states and warranty dates.
-- **Knowledge base:** searchable troubleshooting guides with view counts and a ticket hand-off.
-- **Analytics & reporting:** workload by status, severity and category, resolution rate and SLA health.
-- **Data export:** download the incident register as an Excel-friendly UTF-8 CSV.
-- **Activity trail:** record incident and asset changes with an actor and timestamp.
-- **REST endpoint:** expose key service-desk metrics as JSON at `/api/metrics`.
+- **Role-based access:** secure sign-in with Admin, IT Agent and Employee roles.
+- **Account administration:** Admins can create team accounts and assign roles; passwords are stored as Werkzeug password hashes.
+- **Incident management:** create, search, filter, assign, prioritise and update requests.
+- **Employee self-service:** employees can submit requests and view only requests they created.
+- **Escalation workflow:** escalate active incidents through Service Lead, IT Manager and Incident Manager levels, with a timestamped reason and actor history.
+- **Rule-based smart triage:** suggest priority and response targets from incident keywords and category.
+- **SLA monitoring:** identify overdue incidents and surface an SLA watchlist.
+- **Asset inventory:** register devices, track assignment, department, repair state and warranty.
+- **Knowledge base:** searchable IT help articles and troubleshooting guides.
+- **Analytics & reporting:** view workload by status, severity and category, plus resolution rate and SLA health.
+- **CSV export:** download an Excel-friendly UTF-8 incident register.
+- **REST endpoint:** expose operational metrics as JSON at `/api/metrics`.
+- **CSRF protection:** validate tokens on state-changing form submissions.
 
-## Screens
+## Demo accounts
 
-| Screen | Purpose |
+On a fresh database, PulseDesk seeds three fictional accounts:
+
+| Role | Email | Demo password |
+|---|---|---|
+| Admin | `admin@pulsedesk.demo` | `AdminDemo!2026` |
+| IT Agent | `agent@pulsedesk.demo` | `AgentDemo!2026` |
+| Employee | `employee@pulsedesk.demo` | `EmployeeDemo!2026` |
+
+These credentials are intentionally predictable for a portfolio demonstration. **Do not use them for a real organisation or public deployment.** Change or remove the demo accounts before using real data.
+
+## Role permissions
+
+| Capability | Admin | IT Agent | Employee |
+|---|:---:|:---:|:---:|
+| View operational dashboard | ✓ | ✓ | — |
+| Manage incidents | ✓ | ✓ | Own requests only |
+| Escalate incidents | ✓ | ✓ | — |
+| Manage company assets | ✓ | ✓ | — |
+| View reports and export CSV | ✓ | ✓ | — |
+| Search the knowledge base | ✓ | ✓ | ✓ |
+| Create user accounts | ✓ | — | — |
+
+## Escalation levels
+
+| Level | Escalation target |
 |---|---|
-| Overview | Operational KPIs, live queue, SLA health and recent activity |
-| Incidents | Searchable ticket queue and incident details/workflow |
-| Asset inventory | Device register with ownership and lifecycle states |
-| Knowledge base | Searchable internal support and troubleshooting articles |
-| Reports & insights | Service desk health and workload breakdowns |
+| 1 | Service Lead |
+| 2 | IT Manager |
+| 3 | Incident Manager |
+
+Each escalation records the target level, reason, acting user and timestamp. Resolved incidents cannot be escalated, reasons are required, and the workflow stops at level 3.
 
 ## Run locally
 
@@ -44,7 +72,7 @@ py -m pip install -r requirements.txt
 py app.py
 ```
 
-Open **http://127.0.0.1:5000**. On first launch, the app creates a local SQLite database and seeds fictional demo records.
+Open **http://127.0.0.1:5000** and sign in with one of the demo accounts above.
 
 ## Run the test suite
 
@@ -52,40 +80,44 @@ Open **http://127.0.0.1:5000**. On first launch, the app creates a local SQLite 
 py -m unittest discover -s tests -v
 ```
 
-The tests use isolated temporary databases; they do not alter your everyday demo workspace.
+Each test uses an isolated temporary database for its test actions. Importing the app also runs the idempotent schema initialiser against the local demo database so any pending additive migrations are applied.
 
 ## Project structure
 
 ```
 pulsedesk/
-├── app.py                  # Flask routes, service logic and database setup
+├── app.py                  # Flask routes, auth, permissions and data logic
 ├── instance/               # Local SQLite database and generated secret (ignored)
 ├── static/
 │   ├── app.js              # Modal, navigation and interaction behaviour
 │   └── style.css           # Responsive product UI
 ├── templates/              # Jinja screens and reusable layout
 ├── tests/
-│   └── test_app.py         # Automated integration tests
+│   └── test_app.py         # Authentication and workflow integration tests
+├── docs/
+│   └── pulsedesk-preview.png
 ├── .gitignore
 ├── requirements.txt
 └── README.md
 ```
 
-## Engineering notes
+## Engineering and security notes
 
-- SQLite queries use parameter binding for user-supplied values.
-- The app uses a local, persistent random Flask session secret rather than a hard-coded key.
-- The knowledge article renderer escapes source text before adding a small, controlled set of HTML tags.
-- The demo uses synthetic names and sample records only; do not enter real employee, company or incident data.
+- Existing PulseDesk databases receive additive schema migrations for accounts, ticket ownership and escalation history; existing ticket and asset rows are retained.
+- SQL statements use parameter binding for user-supplied values.
+- Passwords are hashed with Werkzeug's password hashing helpers; plaintext passwords are never stored.
+- Session cookies are HTTP-only and use SameSite=Lax. Set `PULSEDESK_SECURE_COOKIES=1` behind HTTPS to enable the Secure cookie flag. CSRF tokens are checked for POST requests.
+- The knowledge article renderer escapes source text before emitting its controlled HTML subset.
+- Demo records use fictional names. Do not enter real employee or incident information into this demo.
 - Smart triage is transparent, rule-based assistance—not a trained AI model or a substitute for human impact assessment.
-- Authentication, production deployment, file attachments, email notifications and configurable SLA policy are intentionally outside this first portfolio release.
 
-## Suggested next iterations
+This is a local portfolio demonstration, not a production-ready identity or service-management system. A real deployment needs HTTPS, secure-cookie configuration, MFA, login rate-limiting and lockout controls, password reset procedures, monitored backups, a hardened production WSGI server, and an organisation-specific privacy and retention policy.
 
-1. Add role-based authentication and an audit log with field-level history.
-2. Add configurable SLA calendars, escalation rules and notifications.
-3. Add automated API tests, CI workflow and deployment configuration.
-4. Add screenshots and a short product walkthrough to the portfolio.
+## Next iterations
+
+1. Add assignment notifications, SLA calendars and configurable escalation rules.
+2. Add an immutable audit event log and richer user lifecycle controls.
+3. Add CI, deployment configuration and browser-based end-to-end tests.
 
 ## Licence
 

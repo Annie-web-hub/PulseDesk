@@ -1,0 +1,10 @@
+{% extends "auth_base.html" %}{% block title %}Sign in{% endblock %}{% block auth_content %}
+<section class="auth-card"><a class="brand auth-brand" href="{{ url_for('login') }}"><span class="brand-mark"><svg viewBox="0 0 40 40" aria-hidden="true"><path d="M20 4 35 12.5v15L20 36 5 27.5v-15L20 4Z" fill="none" stroke="currentColor" stroke-width="2.6"/><path d="M12 21h5l3-8 4 14 3-6h2" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span><strong>pulse<span>desk</span></strong><small>IT OPERATIONS</small></span></a>
+<div class="auth-eyebrow"><span class="eyebrow-dot"></span> NORTHSTAR STUDIO WORKSPACE</div><h1>Welcome back.</h1><p class="auth-intro">Sign in to keep your team's operations in sync.</p>
+<form method="post" class="auth-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="{{ request.args.get('next','') }}">
+<label class="field">Work email<input type="email" name="email" autocomplete="username" required placeholder="you@company.com"></label>
+<label class="field">Password<input type="password" name="password" autocomplete="current-password" required placeholder="Enter your password"></label>
+<button type="submit" class="button button-primary button-block">Sign in to PulseDesk <span>→</span></button></form>
+<div class="auth-divider"><span>DEMO ACCESS</span></div><div class="demo-hint"><b>Explore the three roles</b><p>Use the demo accounts in the project README to try Admin, IT Agent and Employee access.</p></div>
+<div class="auth-foot"><span>Secure workspace access</span><span>PulseDesk · {{ current_year }}</span></div></section>
+{% endblock %}

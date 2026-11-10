@@ -6,11 +6,14 @@ import os
 import re
 import secrets
 import sqlite3
+from functools import wraps
 from html import escape
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from flask import Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, url_for
+from flask import Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = Path(__file__).resolve().parent
 INSTANCE_DIR = BASE_DIR / "instance"
@@ -26,6 +29,7 @@ app.config.update(
     DATABASE=str(DATABASE),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("PULSEDESK_SECURE_COOKIES", "0") == "1",
     MAX_CONTENT_LENGTH=2 * 1024 * 1024,
 )
 
@@ -33,6 +37,63 @@ STATUSES = ("Open", "In Progress", "Waiting", "Resolved")
 PRIORITIES = ("Low", "Medium", "High", "Critical")
 CATEGORIES = ("Hardware", "Software", "Access", "Network", "Email", "Other")
 ASSET_STATUSES = ("In use", "In repair", "In stock", "Retired")
+ROLES = ("Admin", "IT Agent", "Employee")
+ESCALATION_TARGETS = {1: "Service Lead", 2: "IT Manager", 3: "Incident Manager"}
+DEMO_ACCOUNTS = (
+    ("admin@pulsedesk.demo", "Alex Morgan", "Admin", "AdminDemo!2026"),
+    ("agent@pulsedesk.demo", "Jordan Lee", "IT Agent", "AgentDemo!2026"),
+    ("employee@pulsedesk.demo", "Maya Patel", "Employee", "EmployeeDemo!2026"),
+)
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if g.get("user") is None:
+            return redirect(url_for("login", next=request.path))
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def roles_required(*roles):
+    def decorator(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            user = g.get("user")
+            if user is None:
+                return redirect(url_for("login", next=request.path))
+            if user["role"] not in roles:
+                abort(403)
+            return view(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
+@app.before_request
+def load_user_and_check_csrf():
+    token = session.get("_csrf_token")
+    if not token:
+        session["_csrf_token"] = secrets.token_urlsafe(32)
+        token = session["_csrf_token"]
+    if request.method == "POST":
+        submitted = request.form.get("csrf_token", "")
+        if not submitted or not secrets.compare_digest(token, submitted):
+            abort(400, description="Your form session expired. Refresh the page and try again.")
+    g.user = None
+    user_id = session.get("user_id")
+    if user_id:
+        user = get_db().execute(
+            "SELECT id, email, full_name, role, active FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if user and user["active"]:
+            g.user = user
+        else:
+            session.clear()
+            session["_csrf_token"] = secrets.token_urlsafe(32)
+    if request.endpoint not in ("login", "static") and g.user is None:
+        return redirect(url_for("login", next=request.path))
+
+
 
 
 def connect_db() -> sqlite3.Connection:
@@ -84,6 +145,15 @@ def init_db() -> None:
         db.row_factory = sqlite3.Row
         db.executescript(
             """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                full_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('Admin', 'IT Agent', 'Employee')),
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS tickets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
@@ -96,7 +166,19 @@ def init_db() -> None:
                 assignee TEXT NOT NULL DEFAULT 'Unassigned',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                due_at TEXT NOT NULL
+                due_at TEXT NOT NULL,
+                created_by INTEGER REFERENCES users(id),
+                escalation_level INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS ticket_escalations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+                level INTEGER NOT NULL,
+                target_role TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                actor_id INTEGER REFERENCES users(id),
+                actor_name TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS assets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,8 +209,21 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
             CREATE INDEX IF NOT EXISTS idx_tickets_priority ON tickets(priority);
             CREATE INDEX IF NOT EXISTS idx_tickets_due ON tickets(due_at);
+            CREATE INDEX IF NOT EXISTS idx_escalations_ticket ON ticket_escalations(ticket_id, id);
             """
         )
+        ticket_columns = {row["name"] for row in db.execute("PRAGMA table_info(tickets)")}
+        if "created_by" not in ticket_columns:
+            db.execute("ALTER TABLE tickets ADD COLUMN created_by INTEGER REFERENCES users(id)")
+        if "escalation_level" not in ticket_columns:
+            db.execute("ALTER TABLE tickets ADD COLUMN escalation_level INTEGER NOT NULL DEFAULT 0")
+
+        if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+            for email, full_name, role, password in DEMO_ACCOUNTS:
+                db.execute(
+                    "INSERT INTO users (email, full_name, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (email, full_name, generate_password_hash(password), role, now_iso()),
+                )
         if db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0] == 0:
             seed_demo_data(db)
 
@@ -248,11 +343,107 @@ def ticket_sla(ticket: sqlite3.Row) -> str:
         return "on-track"
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if g.get("user") is not None:
+        return redirect(url_for("dashboard"))
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()[:160]
+        password = request.form.get("password", "")
+        user = get_db().execute(
+            "SELECT id, email, full_name, role, password_hash, active FROM users WHERE email = ? COLLATE NOCASE",
+            (email,),
+        ).fetchone()
+        if not user or not user["active"] or not check_password_hash(user["password_hash"], password):
+            flash("Those sign-in details were not recognised. Please try again.", "error")
+            return render_template("login.html"), 401
+        session.clear()
+        session["user_id"] = user["id"]
+        session["_csrf_token"] = secrets.token_urlsafe(32)
+        next_path = request.form.get("next", "")
+        parsed = urlparse(next_path)
+        safe_next = next_path if not parsed.netloc and next_path.startswith("/") and not next_path.startswith("//") else ""
+        flash(f"Welcome back, {user['full_name'].split()[0]}.", "success")
+        return redirect(safe_next or (url_for("my_tickets") if user["role"] == "Employee" else url_for("dashboard")))
+    return render_template("login.html")
+
+
+@app.post("/logout")
+@login_required
+def logout():
+    session.clear()
+    flash("You have been signed out.", "success")
+    return redirect(url_for("login"))
+
+
+@app.route("/my-tickets", methods=["GET", "POST"])
+@login_required
+def my_tickets():
+    db = get_db()
+    if g.user["role"] != "Employee":
+        return redirect(url_for("tickets_page"))
+    if request.method == "POST":
+        title = request.form.get("title", "").strip()
+        description = request.form.get("description", "").strip()
+        category = request.form.get("category", "Other")
+        department = request.form.get("department", "Operations").strip()[:60] or "Operations"
+        if not title:
+            flash("Add a short title so the IT team knows what you need.", "error")
+            return redirect(url_for("my_tickets"))
+        if category not in CATEGORIES:
+            category = "Other"
+        priority, _reason = recommend_priority(title, description, category)
+        due = datetime.now() + timedelta(hours={"Critical": 2, "High": 8, "Medium": 24, "Low": 72}[priority])
+        cursor = db.execute(
+            """INSERT INTO tickets
+            (title, description, requester, department, category, priority, status, assignee,
+             created_at, updated_at, due_at, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, 'Open', 'Unassigned', ?, ?, ?, ?)""",
+            (title[:140], description[:2000], g.user["full_name"], department, category, priority,
+             now_iso(), now_iso(), due.replace(microsecond=0).isoformat(timespec="seconds"), g.user["id"]),
+        )
+        log_activity(db, "Employee request created", f"#{cursor.lastrowid} ? {title[:100]}", g.user["full_name"])
+        db.commit()
+        flash(f"Your request #{cursor.lastrowid} has been sent to IT.", "success")
+        return redirect(url_for("my_tickets"))
+    tickets = db.execute("SELECT * FROM tickets WHERE created_by = ? ORDER BY created_at DESC", (g.user["id"],)).fetchall()
+    return render_template("my_tickets.html", active_page="my_tickets", tickets=tickets)
+
+
+@app.route("/admin/users", methods=["GET", "POST"])
+@roles_required("Admin")
+def admin_users():
+    db = get_db()
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()[:160]
+        full_name = request.form.get("full_name", "").strip()[:100]
+        role = request.form.get("role", "")
+        password = request.form.get("password", "")
+        if not email or "@" not in email or not full_name or role not in ROLES or len(password) < 12:
+            flash("Provide a valid email, name, role and password of at least 12 characters.", "error")
+        else:
+            try:
+                db.execute(
+                    "INSERT INTO users (email, full_name, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (email, full_name, generate_password_hash(password), role, now_iso()),
+                )
+                log_activity(db, "User added", f"{full_name} ? {role}", g.user["full_name"])
+                db.commit()
+                flash(f"Account for {full_name} created.", "success")
+            except sqlite3.IntegrityError:
+                flash("That email address already has an account.", "error")
+        return redirect(url_for("admin_users"))
+    users = db.execute("SELECT id, email, full_name, role, active, created_at FROM users ORDER BY full_name").fetchall()
+    return render_template("admin_users.html", active_page="users", users=users, roles=ROLES)
+
+
 @app.context_processor
 def inject_globals():
     db = get_db()
     open_count = db.execute("SELECT COUNT(*) FROM tickets WHERE status != 'Resolved'").fetchone()[0]
     return {
+        "current_user": g.get("user"),
+        "csrf_token": session.get("_csrf_token", ""),
         "open_count_global": open_count,
         "now_string": now_iso(),
         "current_year": datetime.now().year,
@@ -265,7 +456,10 @@ def inject_globals():
 
 
 @app.route("/")
+@login_required
 def dashboard():
+    if g.user["role"] == "Employee":
+        return redirect(url_for("my_tickets"))
     db = get_db()
     tickets = db.execute("SELECT * FROM tickets ORDER BY created_at DESC").fetchall()
     open_count = sum(t["status"] in ("Open", "In Progress", "Waiting") for t in tickets)
@@ -286,6 +480,7 @@ def dashboard():
 
 
 @app.route("/tickets", methods=["GET", "POST"])
+@roles_required("Admin", "IT Agent")
 def tickets_page():
     db = get_db()
     if request.method == "POST":
@@ -308,7 +503,7 @@ def tickets_page():
             (title[:140], description[:2000], requester[:100], department, category, priority, assignee,
              now_iso(), now_iso(), due.replace(microsecond=0).isoformat(timespec="seconds")),
         )
-        log_activity(db, "Ticket created", f"#{cursor.lastrowid} · {title[:100]} · {priority} priority")
+        log_activity(db, "Ticket created", f"#{cursor.lastrowid} ? {title[:100]} ? {priority} priority", g.user["full_name"])
         db.commit()
         flash(f"Ticket #{cursor.lastrowid} created. Triage suggested {priority} priority.", "success")
         return redirect(url_for("ticket_detail", ticket_id=cursor.lastrowid))
@@ -336,11 +531,16 @@ def tickets_page():
 
 
 @app.route("/tickets/<int:ticket_id>", methods=["GET", "POST"])
+@login_required
 def ticket_detail(ticket_id: int):
     db = get_db()
     ticket = db.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
     if ticket is None:
         abort(404)
+    if g.user["role"] == "Employee" and ticket["created_by"] != g.user["id"]:
+        abort(404)
+    if g.user["role"] == "Employee" and request.method == "POST":
+        abort(403)
     if request.method == "POST":
         status = request.form.get("status", ticket["status"])
         priority = request.form.get("priority", ticket["priority"])
@@ -351,16 +551,55 @@ def ticket_detail(ticket_id: int):
             "UPDATE tickets SET status = ?, priority = ?, assignee = ?, updated_at = ? WHERE id = ?",
             (status, priority, assignee or "Unassigned", now_iso(), ticket_id),
         )
-        log_activity(db, "Ticket updated", f"#{ticket_id} · status: {status} · priority: {priority}")
+        log_activity(db, "Ticket updated", f"#{ticket_id} ? status: {status} ? priority: {priority}", g.user["full_name"])
         db.commit()
         flash(f"Ticket #{ticket_id} updated.", "success")
         return redirect(url_for("ticket_detail", ticket_id=ticket_id))
     suggested_priority, triage_reason = recommend_priority(ticket["title"], ticket["description"], ticket["category"])
+    escalation_history = db.execute(
+        "SELECT * FROM ticket_escalations WHERE ticket_id = ? ORDER BY id DESC", (ticket_id,)
+    ).fetchall()
     return render_template("ticket_detail.html", active_page="tickets", ticket=ticket,
-                           sla=ticket_sla(ticket), suggested_priority=suggested_priority, triage_reason=triage_reason)
+                           sla=ticket_sla(ticket), suggested_priority=suggested_priority, triage_reason=triage_reason,
+                           escalation_history=escalation_history, escalation_targets=ESCALATION_TARGETS)
+
+
+@app.post("/tickets/<int:ticket_id>/escalate")
+@roles_required("Admin", "IT Agent")
+def escalate_ticket(ticket_id: int):
+    db = get_db()
+    ticket = db.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+    if ticket is None:
+        abort(404)
+    if ticket["status"] == "Resolved":
+        flash("Resolved incidents cannot be escalated.", "error")
+        return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+    next_level = int(ticket["escalation_level"] or 0) + 1
+    if next_level not in ESCALATION_TARGETS:
+        flash("This incident has reached the highest escalation level.", "error")
+        return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+    reason = request.form.get("reason", "").strip()[:1000]
+    if len(reason) < 8:
+        flash("Add at least 8 characters explaining why the incident needs escalation.", "error")
+        return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+    target = ESCALATION_TARGETS[next_level]
+    actor = g.user["full_name"]
+    db.execute(
+        """INSERT INTO ticket_escalations
+        (ticket_id, level, target_role, reason, actor_id, actor_name, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (ticket_id, next_level, target, reason, g.user["id"], actor, now_iso()),
+    )
+    db.execute("UPDATE tickets SET escalation_level = ?, updated_at = ? WHERE id = ?",
+               (next_level, now_iso(), ticket_id))
+    log_activity(db, "Incident escalated", f"#{ticket_id} ? Level {next_level} ? {target}", actor)
+    db.commit()
+    flash(f"Incident #{ticket_id} escalated to {target}.", "success")
+    return redirect(url_for("ticket_detail", ticket_id=ticket_id))
 
 
 @app.route("/assets", methods=["GET", "POST"])
+@roles_required("Admin", "IT Agent")
 def assets_page():
     db = get_db()
     if request.method == "POST":
@@ -379,7 +618,7 @@ def assets_page():
                     "INSERT INTO assets (asset_tag, name, asset_type, assigned_to, department, status, warranty_until) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (tag, name[:100], asset_type, assigned, department, status, warranty),
                 )
-                log_activity(db, "Asset registered", f"{tag} · {name[:80]}")
+                log_activity(db, "Asset registered", f"{tag} ? {name[:80]}", g.user["full_name"])
                 db.commit()
                 flash(f"Asset {tag} added to the inventory.", "success")
             except sqlite3.IntegrityError:
@@ -395,6 +634,7 @@ def assets_page():
 
 
 @app.route("/knowledge")
+@login_required
 def knowledge_page():
     db = get_db()
     q = request.args.get("q", "").strip()[:100]
@@ -406,6 +646,7 @@ def knowledge_page():
 
 
 @app.route("/knowledge/<int:article_id>")
+@login_required
 def article_detail(article_id: int):
     db = get_db()
     article = db.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone()
@@ -417,6 +658,7 @@ def article_detail(article_id: int):
 
 
 @app.route("/reports")
+@roles_required("Admin", "IT Agent")
 def reports_page():
     db = get_db()
     total = db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
@@ -433,6 +675,7 @@ def reports_page():
 
 
 @app.route("/export/tickets.csv")
+@roles_required("Admin", "IT Agent")
 def export_tickets():
     db = get_db()
     rows = db.execute("SELECT id, title, requester, department, category, priority, status, assignee, created_at, due_at FROM tickets ORDER BY id").fetchall()
@@ -447,6 +690,7 @@ def export_tickets():
 
 
 @app.route("/api/metrics")
+@roles_required("Admin", "IT Agent")
 def metrics_api():
     db = get_db()
     tickets = db.execute("SELECT * FROM tickets").fetchall()
@@ -463,6 +707,10 @@ def metrics_api():
 @app.errorhandler(404)
 def not_found(_error):
     return render_template("error.html", active_page=""), 404
+
+@app.errorhandler(403)
+def forbidden(_error):
+    return render_template("error.html", active_page=""), 403
 
 
 @app.errorhandler(413)
