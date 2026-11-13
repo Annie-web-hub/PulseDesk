@@ -1,0 +1,49 @@
+{% extends "base.html" %}{% block title %}Pulse Assist{% endblock %}{% block breadcrumb %}PULSE ASSIST / SMART IT DESK{% endblock %}{% block content %}
+<section class="assistant-hero">
+<div class="assistant-hero-copy"><div class="eyebrow mono"><span class="eyebrow-dot"></span> SYSTEM 04 / DECISION SUPPORT</div><h1>Turn the noise<br>into <em>next steps.</em></h1><p>Analyse incident signals, find relevant runbooks and spot recurring support themes — all from your live workspace data.</p><div class="assistant-trust"><span>✳ RULE-BASED</span><span>·</span><span>EXPLAINABLE OUTPUT</span><span>·</span><span>HUMAN IN THE LOOP</span></div></div>
+<div class="assistant-orbit-visual"><span class="assistant-orbit o1"></span><span class="assistant-orbit o2"></span><span class="assistant-orbit o3"></span><div class="assistant-core">P<span>A</span></div><i class="assistant-node node-one">⌁</i><i class="assistant-node node-two">◫</i><i class="assistant-node node-three">✳</i><small>INCIDENT INTELLIGENCE</small></div>
+</section>
+<section class="assistant-kpis">
+<article class="panel assistant-kpi"><span>ACTIVE QUEUE</span><strong>{{ summary.active }}</strong><small>Unresolved incidents</small></article>
+<article class="panel assistant-kpi kpi-coral"><span>CRITICAL</span><strong>{{ summary.critical }}</strong><small>Active critical items</small></article>
+<article class="panel assistant-kpi kpi-amber"><span>SLA OVERDUE</span><strong>{{ summary.overdue }}</strong><small>Past due now</small></article>
+<article class="panel assistant-kpi kpi-lime"><span>UNASSIGNED</span><strong>{{ summary.unassigned }}</strong><small>Need an owner</small></article>
+</section>
+<section class="assistant-main-grid">
+<article class="panel assistant-analyzer">
+<div class="section-head"><div><div class="section-kicker mono">01 / INCIDENT ANALYSER</div><h2>Give Pulse Assist a signal</h2><p class="chart-subtitle">Describe the issue in plain language. No external AI service is called.</p></div><span class="assistant-status"><i></i> READY</span></div>
+<form method="post" action="{{ url_for('smart_assistant') }}" class="assistant-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<label class="field">Incident title <span>*</span><input name="title" maxlength="140" required value="{{ form_data.title }}" placeholder="e.g. VPN outage affecting the sales team"></label>
+<label class="field">Category<select name="category">{% for category in ticket_categories %}<option value="{{ category }}" {% if form_data.category == category %}selected{% endif %}>{{ category }}</option>{% endfor %}</select></label>
+<label class="field">What is happening?<textarea name="description" rows="5" maxlength="2000" placeholder="Who is affected? When did it start? What is blocked? Include relevant errors, but never enter passwords, MFA codes or personal secrets.">{{ form_data.description }}</textarea></label>
+<div class="assistant-samples"><span class="mono">TRY A SCENARIO</span><button type="button" data-assistant-sample="vpn">VPN outage</button><button type="button" data-assistant-sample="security">Suspicious sign-in</button><button type="button" data-assistant-sample="hardware">Printer failure</button></div>
+<button class="button button-acid assistant-submit" type="submit">Analyse incident <span>✳</span></button>
+</form>
+<div class="assistant-method-note"><span>ⓘ</span><p><b>How it works:</b> transparent phrase and category rules detect impact signals, suggest a starting priority and rank existing knowledge articles by keyword overlap. Results are not a diagnosis or an autonomous decision.</p></div>
+</article>
+<aside class="panel daily-brief">
+<div class="section-head"><div><div class="section-kicker mono">02 / DAILY OPERATIONS BRIEF</div><h2>Today's pulse</h2></div><span class="brief-live"><i></i> LIVE DATA</span></div>
+<div class="brief-date">{{ summary.date_label }}</div>
+<div class="brief-mini-grid"><div><b>{{ summary.created_today }}</b><small>Created today</small></div><div><b>{{ summary.resolved_today }}</b><small>Resolved today</small></div><div><b>{{ summary.total }}</b><small>All incidents</small></div><div><b>{{ summary.top_category }}</b><small>Largest active category</small></div></div>
+<div class="brief-highlights"><div class="section-kicker mono">ATTENTION POINTS</div>{% for item in summary.highlights %}<div class="brief-highlight"><span>{{ loop.index }}</span><p>{{ item }}</p></div>{% endfor %}</div>
+<a class="brief-link" href="{{ url_for('tickets_page',sla='breached') }}">Review operational risks ↗</a>
+</aside>
+</section>
+{% if analysis %}
+<section class="assistant-results" id="analysis-results">
+<div class="assistant-results-head"><div><div class="eyebrow mono"><span class="eyebrow-dot"></span> ANALYSIS COMPLETE / HUMAN REVIEW REQUIRED</div><h2>{{ analysis.title }}</h2><p>{{ analysis.category }} · {{ analysis.method }}</p></div><span class="assistant-priority priority-{{ analysis.suggested_priority|lower }}"><i></i>{{ analysis.suggested_priority|upper }} SUGGESTED</span></div>
+<div class="analysis-grid">
+<article class="panel analysis-recommendation"><div class="section-head"><div><div class="section-kicker mono">03 / TRIAGE OUTCOME</div><h3>Recommended starting point</h3></div><span class="target-chip">TARGET / {{ analysis.response_target }}</span></div><div class="analysis-priority-line"><span class="priority-orb orb-{{ analysis.suggested_priority|lower }}">✳</span><div><small>RECOMMENDED PRIORITY</small><b>{{ analysis.suggested_priority }}</b></div></div><p class="analysis-reason">{{ analysis.reason }}</p>
+<div class="analysis-subhead">DETECTED SIGNALS</div>{% if analysis.signals %}<div class="signal-tags">{% for signal in analysis.signals %}<div class="analysis-signal"><b>{{ signal.label }}</b><small>{{ signal.explanation }}</small></div>{% endfor %}</div>{% else %}<p class="no-signal">No specific high-impact phrases were found. Confirm affected users and business impact before finalising priority.</p>{% endif %}
+<div class="analysis-review"><span>ⓘ</span>{{ analysis.review_note }}</div></article>
+<article class="panel analysis-checks"><div class="section-head"><div><div class="section-kicker mono">04 / NEXT ACTIONS</div><h3>Suggested investigation steps</h3></div><span class="check-count">{{ analysis.checks|length }} CHECKS</span></div><ol class="action-checklist">{% for check in analysis.checks %}<li><span>{{ '%02d'|format(loop.index) }}</span><p>{{ check }}</p></li>{% endfor %}</ol></article>
+</div>
+<article class="panel matched-articles"><div class="section-head"><div><div class="section-kicker mono">05 / KNOWLEDGE MATCH</div><h3>Runbooks worth opening</h3><p class="chart-subtitle">Ranked from the current knowledge base using matching words and category.</p></div><a class="text-link mono" href="{{ url_for('knowledge_page') }}">ALL RUNBOOKS ↗</a></div>
+<div class="matched-article-grid">{% for article in analysis.articles %}<a class="matched-article" href="{{ url_for('article_detail',article_id=article.id) }}"><span class="matched-article-icon">▤</span><span><small>{{ article.category|upper }} · MATCH SCORE {{ article.score }}</small><b>{{ article.title }}</b><em>{{ article.summary }}</em>{% if article.matched_terms %}<i>Matched: {{ article.matched_terms|join(', ') }}</i>{% endif %}</span><strong>↗</strong></a>{% else %}<div class="no-article-match">No strong runbook match was found. Browse the knowledge base or ask an IT teammate for guidance.</div>{% endfor %}</div></article>
+</section>
+{% endif %}
+<section class="panel recurrence-panel"><div class="section-head"><div><div class="section-kicker mono">06 / PATTERN RADAR</div><h2>Recurring incident themes</h2><p class="chart-subtitle">Keyword-based groups from the last 90 days. A theme is shown after at least two matching incidents.</p></div><span class="chart-period-tag">90 DAY WINDOW</span></div>
+{% if summary.patterns %}<div class="recurrence-grid">{% for pattern in summary.patterns %}<article class="recurrence-card"><div class="recurrence-card-top"><span class="recurrence-icon">⌁</span><span class="recurrence-count">{{ pattern.count }} MATCHES</span></div><h3>{{ pattern.theme }}</h3><div class="recurrence-metrics"><span><b>{{ pattern.open_count }}</b> OPEN</span><span><b>{{ pattern.critical_count }}</b> CRITICAL</span></div><div class="recurrence-samples">{% for sample in pattern.samples %}<a href="{{ url_for('ticket_detail',ticket_id=sample.id) }}"><span>#{{ '%04d'|format(sample.id) }}</span>{{ sample.title|truncate(45) }} ↗</a>{% endfor %}</div><small class="recurrence-terms">MATCHED: {{ pattern.matched_terms|join(', ') }}</small></article>{% endfor %}</div>{% else %}<div class="recurrence-empty"><span>◎</span><b>No repeated themes detected yet.</b><p>As more incidents are recorded, repeated keyword patterns will appear here.</p></div>{% endif %}
+<div class="recurrence-disclaimer">Pattern groups are heuristic keyword signals, not proof of a common root cause or duplicate incidents. Review each ticket before taking action.</div></section>
+<section class="assistant-footer-note"><span>✳</span><p><b>Built to assist, not replace judgement.</b> Pulse Assist runs locally against your PulseDesk data. It does not call an external AI model, send ticket text to a third party or change incident priority automatically.</p><a href="{{ url_for('reports_page') }}">OPEN INTELLIGENCE ↗</a></section>
+{% endblock %}

@@ -432,6 +432,150 @@ class PulseDeskTests(unittest.TestCase):
         self.assertIn(b"Connect to the company VPN", response.data)
         self.assertNotIn(b"Prepare a laptop", response.data)
 
+    def test_pulse_assistant_recommends_priority_with_explainable_signals(self):
+        with app.app_context():
+            db = app_module.get_db()
+            result = app_module.analyse_incident(
+                db,
+                "VPN outage affecting all users",
+                "The whole team is blocked and internal tools are unavailable.",
+                "Network",
+            )
+        self.assertEqual(result["suggested_priority"], "Critical")
+        self.assertEqual(result["response_target"], "Immediately")
+        self.assertIn("Broad impact", {item["label"] for item in result["signals"]})
+        self.assertIn("Service outage", {item["label"] for item in result["signals"]})
+        self.assertIn("Confirm whether the issue affects one device", result["checks"][0])
+        self.assertTrue(result["articles"])
+        self.assertIn("VPN", result["articles"][0]["title"])
+        self.assertIn("human", result["review_note"].lower())
+
+    def test_pulse_assistant_handles_security_signals_safely(self):
+        with app.app_context():
+            result = app_module.analyse_incident(
+                app_module.get_db(),
+                "Suspicious sign-in alert",
+                "A user received an unexpected MFA prompt and does not recognise the location.",
+                "Access",
+            )
+        self.assertEqual(result["suggested_priority"], "High")
+        self.assertIn("Security signal", {item["label"] for item in result["signals"]})
+        self.assertTrue(any("Do not approve" in item for item in result["checks"]))
+        self.assertTrue(any("suspicious sign-in" in item["title"].lower() for item in result["articles"]))
+
+    def test_knowledge_matcher_ranks_relevant_existing_runbooks(self):
+        with app.app_context():
+            matches = app_module.match_knowledge_articles(
+                app_module.get_db(), "company VPN disconnects from home network", "Network"
+            )
+        self.assertTrue(matches)
+        self.assertEqual(matches[0]["title"], "Connect to the company VPN")
+        self.assertIn("vpn", matches[0]["matched_terms"])
+
+    def test_recurring_incident_detector_groups_real_recent_ticket_themes(self):
+        now = datetime.now().replace(microsecond=0)
+        with sqlite3.connect(self.db_path) as db:
+            rows = []
+            for index, title in enumerate((
+                "VPN connection unstable for finance team",
+                "Network VPN disconnects after a few minutes",
+            )):
+                created = (now - timedelta(days=index + 1)).isoformat(timespec="seconds")
+                rows.append((
+                    title, "Users lose VPN connectivity and cannot reach internal tools.",
+                    "Sample User", "Finance", "Network", "High", "Open", "Jordan Lee",
+                    created, created, (now + timedelta(days=1)).isoformat(timespec="seconds"),
+                ))
+            db.executemany(
+                """INSERT INTO tickets
+                (title, description, requester, department, category, priority, status, assignee,
+                 created_at, updated_at, due_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                rows,
+            )
+            db.commit()
+        with app.app_context():
+            tickets = app_module.get_db().execute("SELECT * FROM tickets").fetchall()
+            patterns = app_module.detect_recurring_incidents(tickets, 90)
+        vpn = next(item for item in patterns if item["theme"] == "VPN & connectivity")
+        self.assertGreaterEqual(vpn["count"], 3)
+        self.assertGreaterEqual(vpn["open_count"], 2)
+        self.assertTrue(vpn["ticket_ids"])
+
+    def test_daily_operations_summary_uses_current_database_records(self):
+        now = datetime.now().replace(microsecond=0)
+        created = now.isoformat(timespec="seconds")
+        due = (now + timedelta(hours=2)).isoformat(timespec="seconds")
+        with sqlite3.connect(self.db_path) as db:
+            db.execute(
+                """INSERT INTO tickets
+                (title, description, requester, department, category, priority, status, assignee,
+                 created_at, updated_at, due_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("Today's assistant test ticket", "A current test incident.", "Test Requester",
+                 "Engineering", "Software", "Critical", "Open", "Unassigned",
+                 created, created, due),
+            )
+            db.commit()
+        with app.app_context():
+            summary = app_module.build_daily_operations_summary(app_module.get_db())
+        self.assertEqual(summary["created_today"], 1)
+        self.assertEqual(summary["active"], 10)
+        self.assertEqual(summary["critical"], 3)
+        self.assertGreaterEqual(summary["unassigned"], 1)
+        self.assertTrue(any("critical incident" in item.lower() for item in summary["highlights"]))
+
+    def test_pulse_assistant_page_renders_analysis_and_daily_summary(self):
+        response = self.client.get("/assistant")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Turn the noise", response.data)
+        self.assertIn(b"Today's pulse", response.data)
+        self.assertIn(b"Recurring incident themes", response.data)
+        response = self.post("/assistant", {
+            "title": "VPN outage affecting every department",
+            "description": "All users are unable to connect.",
+            "category": "Network",
+        }, follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"CRITICAL SUGGESTED", response.data)
+        self.assertIn(b"Runbooks worth opening", response.data)
+
+    def test_assistant_api_requires_role_and_csrf_and_returns_analysis(self):
+        with self.client.session_transaction() as session:
+            csrf = session["_csrf_token"]
+        response = self.client.post(
+            "/api/assistant/analyze",
+            json={
+                "title": "Suspicious sign-in across multiple departments",
+                "description": "Multiple users report suspicious sign-in alerts.",
+                "category": "Access",
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertIn(payload["suggested_priority"], ("High", "Critical"))
+        self.assertIn("signals", payload)
+        missing = self.client.post(
+            "/api/assistant/analyze",
+            json={"description": "No title supplied."},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(missing.status_code, 400)
+        employee = self.login_client("employee@pulsedesk.demo", "EmployeeDemo!2026")
+        self.assertEqual(employee.get("/assistant").status_code, 403)
+        self.assertEqual(employee.get("/api/assistant/summary").status_code, 403)
+        self.assertEqual(employee.get("/api/assistant/recurrences").status_code, 403)
+
+    def test_assistant_summary_and_recurring_pattern_apis_return_json(self):
+        summary = self.client.get("/api/assistant/summary")
+        self.assertEqual(summary.status_code, 200)
+        self.assertIn("created_today", summary.get_json())
+        recurring = self.client.get("/api/assistant/recurrences?days=400")
+        self.assertEqual(recurring.status_code, 200)
+        self.assertEqual(recurring.get_json()["days"], 365)
+        self.assertIn("patterns", recurring.get_json())
+
     def test_analytics_page_renders_period_filter_charts_and_team_table(self):
         response = self.client.get("/reports?days=7")
         self.assertEqual(response.status_code, 200)

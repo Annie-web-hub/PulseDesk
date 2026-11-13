@@ -31,6 +31,11 @@ PulseDesk is a portfolio project demonstrating how an IT team can manage inciden
 - **Email alerts:** SMTP delivery for new requests, incident status changes and escalations; delivery outcomes are recorded in an admin-visible outbox.
 - **Live updates:** protected polling API refreshes activity, notification counts, SLA metrics and visible incident rows every eight seconds.
 - **Distinctive operations UI:** a dark control-room interface with live telemetry, signal stream and responsive layouts.
+- **Pulse Assist:** explainable incident analysis with priority recommendations, detected impact signals and category-specific investigation checklists.
+- **Knowledge matching:** rank existing runbooks using keyword overlap across article titles, summaries and content, with a small category-match boost.
+- **Recurring incident radar:** group tickets from a rolling 90-day window into visible keyword themes and link back to the source incidents.
+- **Daily operations brief:** calculate today's created/resolved volume, current active/critical/overdue/unassigned workload, recurring themes and recent activity.
+- **Assistant API:** role-protected JSON endpoints for incident analysis, daily summary and recurring patterns.
 
 ## Analytics definitions
 
@@ -39,6 +44,26 @@ PulseDesk is a portfolio project demonstrating how an IT team can manage inciden
 - **Active and overdue** counts reflect the current register, not just tickets created inside the selected window. SLA compliance is measured against the active queue; resolved incidents are excluded from its denominator.
 - **Team attribution** uses each incident's current assignee because this demo does not yet keep a reassignment history. “Assigned in period” counts tickets created in the selected window by their current assignee.
 - **Average resolution hours** is calculated from `created_at` to `resolved_at` for incidents resolved during the window. It is shown only where at least one resolution sample exists.
+
+## Pulse Assist rules and interpretation
+
+Pulse Assist is intentionally a transparent local rules engine, not a trained language model or a third-party AI integration.
+
+- Priority suggestions reuse the existing ticket triage rules and add explicit impact signals for service outages, broad impact, blocked work and possible security indicators.
+- Investigation steps vary by category. Security-related phrases produce conservative guidance to avoid unexpected MFA approval, preserve alert details and follow the authorised incident-response process.
+- Runbooks are ranked from the existing article table using keyword overlap: title matches carry the highest weight, followed by summary and article-content matches; an exact category match adds a small boost.
+- Recurrence groups use a fixed keyword-theme dictionary over tickets created within the last 90 days. At least two tickets are required before a theme is shown. These are investigation leads, not proof of duplicate incidents or a shared root cause.
+- The daily operations brief uses the computer's local date/time and current ticket records. It is a snapshot at page load, not a scheduled email report.
+- Suggestions never update a ticket's priority or status automatically. An IT responder must validate impact, urgency and the recommended action.
+
+Useful endpoints (Admin and IT Agent roles only):
+
+| Endpoint | Purpose |
+|---|---|
+| `/assistant` | Smart IT Assistant workspace |
+| `POST /api/assistant/analyze` | Analyse a supplied incident JSON object (requires session and CSRF token) |
+| `/api/assistant/summary` | Today's operational summary |
+| `/api/assistant/recurrences?days=90` | Keyword-theme recurrence scan |
 
 ## Demo accounts
 
@@ -63,6 +88,7 @@ These credentials are intentionally predictable for a portfolio demonstration. *
 | View reports and export CSV | ✓ | ✓ | — |
 | Search the knowledge base | ✓ | ✓ | ✓ |
 | Create user accounts | ✓ | — | — |
+| Use Pulse Assist and view daily IT brief | ✓ | ✓ | — |
 
 ## Escalation levels
 
@@ -126,7 +152,9 @@ pulsedesk/
 │   ├── app.js              # Modal, navigation and live update behaviour
 │   ├── analytics.js        # Interactive reporting charts
 │   └── style.css           # Responsive product UI
-├── templates/              # Jinja screens and reusable layout
+├── templates/
+│   ├── assistant.html      # Pulse Assist, daily brief and pattern radar
+│   └── ...                 # Other Jinja screens and reusable layout
 ├── tests/
 │   └── test_app.py         # Authentication and workflow integration tests
 ├── docs/
@@ -146,7 +174,8 @@ pulsedesk/
 - Session cookies are HTTP-only and use SameSite=Lax. Set `PULSEDESK_SECURE_COOKIES=1` behind HTTPS to enable the Secure cookie flag. CSRF tokens are checked for POST requests.
 - The knowledge article renderer escapes source text before emitting its controlled HTML subset.
 - Demo records use fictional names. Do not enter real employee or incident information into this demo.
-- Smart triage is transparent, rule-based assistance—not a trained AI model or a substitute for human impact assessment.
+- Smart triage and Pulse Assist use transparent keyword/category rules, not a trained AI model; all recommendations require human review.
+- Knowledge matches and recurring themes are heuristic signals, not semantic root-cause analysis or duplicate detection.
 - Email alerts are sent only when SMTP host and sender settings are present; otherwise the outbox records a preview rather than claiming delivery.
 - The live dashboard uses authenticated eight-second HTTP polling, not a persistent WebSocket connection.
 

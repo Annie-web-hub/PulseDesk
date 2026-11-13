@@ -1,5 +1,9 @@
 document.addEventListener("DOMContentLoaded", () => {
   const body = document.body;
+  const analysisResults = document.getElementById("analysis-results");
+  if (analysisResults) {
+    analysisResults.scrollIntoView({behavior: "smooth", block: "start"});
+  }
   const openModal = (id) => {
     const modal = document.getElementById(id);
     if (!modal) return;
@@ -98,6 +102,38 @@ document.addEventListener("DOMContentLoaded", () => {
       button.classList.add("demo-selected");
     });
   });
+  const assistantScenarios = {
+    vpn: {
+      title: "VPN outage affecting the sales team",
+      category: "Network",
+      description: "Several sales colleagues cannot connect to the company VPN. Client calls and access to internal tools are blocked. The issue started about 20 minutes ago."
+    },
+    security: {
+      title: "Suspicious sign-in alert on a finance account",
+      category: "Access",
+      description: "A finance colleague received an unexpected sign-in notification and does not recognise the device or location. They have not approved any MFA prompts."
+    },
+    hardware: {
+      title: "Shared printer queue stopped on floor 3",
+      category: "Hardware",
+      description: "Print jobs are stuck for several colleagues. The printer is powered on but no new jobs are coming through."
+    }
+  };
+  document.querySelectorAll("[data-assistant-sample]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const scenario = assistantScenarios[button.dataset.assistantSample];
+      if (!scenario) return;
+      const form = button.closest("form");
+      if (!form) return;
+      form.querySelector('[name="title"]').value = scenario.title;
+      form.querySelector('[name="category"]').value = scenario.category;
+      form.querySelector('[name="description"]').value = scenario.description;
+      form.querySelector('[name="title"]').focus();
+      document.querySelectorAll("[data-assistant-sample]").forEach((item) => item.classList.remove("sample-selected"));
+      button.classList.add("sample-selected");
+    });
+  });
+
   document.querySelectorAll(".filter-search").forEach((form) => {
     const input = form.querySelector("input[name='q']");
     input?.addEventListener("keydown", (event) => {

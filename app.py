@@ -78,7 +78,12 @@ def load_user_and_check_csrf():
         session["_csrf_token"] = secrets.token_urlsafe(32)
         token = session["_csrf_token"]
     if request.method == "POST":
-        submitted = request.form.get("csrf_token", "")
+        json_payload = request.get_json(silent=True) or {}
+        submitted = (
+            request.form.get("csrf_token", "")
+            or request.headers.get("X-CSRF-Token", "")
+            or (json_payload.get("csrf_token", "") if isinstance(json_payload, dict) else "")
+        )
         if not submitted or not secrets.compare_digest(token, submitted):
             abort(400, description="Your form session expired. Refresh the page and try again.")
     g.user = None
@@ -240,6 +245,274 @@ def recommend_priority(title: str, description: str, category: str) -> tuple[str
     if category in ("Access", "Network") or any(word in text for word in ("intermittent", "slow", "permission")):
         return "Medium", "A service or access issue needs investigation."
     return "Low", "No urgent impact signals detected. Confirm impact with the requester."
+
+
+_ASSISTANT_STOP_WORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "when", "where",
+    "have", "has", "had", "are", "was", "were", "our", "their", "they",
+    "them", "into", "after", "before", "please", "help", "need", "unable",
+    "not", "but", "you", "your", "can", "cannot", "could", "would", "should",
+    "issue", "problem", "user", "users", "team", "work", "working",
+}
+
+
+def _assistant_terms(value: str) -> set[str]:
+    return {
+        term for term in re.findall(r"[a-z0-9]{3,}", (value or "").lower())
+        if term not in _ASSISTANT_STOP_WORDS
+    }
+
+
+def match_knowledge_articles(
+    db: sqlite3.Connection, query: str, category: str = ""
+) -> list[dict]:
+    """Rank existing runbooks by transparent keyword overlap and category match."""
+    terms = _assistant_terms(query)
+    articles = db.execute("SELECT id, title, category, summary, content FROM articles").fetchall()
+    ranked = []
+    for article in articles:
+        title_terms = _assistant_terms(article["title"])
+        summary_terms = _assistant_terms(article["summary"])
+        content_terms = _assistant_terms(article["content"])
+        title_hits = terms & title_terms
+        summary_hits = terms & summary_terms
+        content_hits = terms & content_terms
+        category_match = bool(category and article["category"].lower() == category.lower())
+        score = len(title_hits) * 4 + len(summary_hits) * 2 + len(content_hits)
+        if category_match:
+            score += 2
+        if score < 2:
+            continue
+        matched_terms = sorted(title_hits | summary_hits | content_hits)
+        ranked.append({
+            "id": article["id"],
+            "title": article["title"],
+            "category": article["category"],
+            "summary": article["summary"],
+            "score": score,
+            "matched_terms": matched_terms[:6],
+            "category_match": category_match,
+        })
+    ranked.sort(key=lambda item: (-item["score"], -len(item["matched_terms"]), item["title"].lower()))
+    return ranked[:4]
+
+
+def analyse_incident(
+    db: sqlite3.Connection, title: str, description: str, category: str
+) -> dict:
+    """Create a human-reviewable triage brief; this is rule-based, not an AI model."""
+    title = (title or "").strip()[:140]
+    description = (description or "").strip()[:2000]
+    category = category if category in CATEGORIES else "Other"
+    text = f"{title} {description}".lower()
+    suggested_priority, base_reason = recommend_priority(title, description, category)
+
+    impact_rules = [
+        ("Service outage", ("outage", "server down", "service unavailable", "production down"), "A service outage phrase was found."),
+        ("Broad impact", ("all users", "whole team", "multiple departments", "company-wide", "everyone affected"), "The description suggests multiple people or teams may be affected."),
+        ("Security signal", ("ransomware", "data breach", "data loss", "suspicious sign-in", "phishing", "malware", "unauthorised access", "unauthorized access"), "A security-related phrase needs prompt human review."),
+        ("Work blocked", ("cannot work", "can't work", "production blocked", "release blocked", "locked out", "business blocked"), "A user or workflow may be blocked."),
+    ]
+    signals = []
+    for label, phrases, explanation in impact_rules:
+        if any(phrase in text for phrase in phrases):
+            signals.append({"label": label, "explanation": explanation})
+
+    if any(signal["label"] in ("Service outage", "Broad impact") for signal in signals):
+        suggested_priority = "Critical"
+        reason = "Possible service-wide impact detected. Confirm scope and business impact immediately."
+    elif any(signal["label"] == "Security signal" for signal in signals):
+        suggested_priority = "High" if suggested_priority != "Critical" else suggested_priority
+        reason = "A possible security indicator was detected. Follow the organisation's security response process."
+    else:
+        reason = base_reason
+
+    if suggested_priority == "Critical":
+        response_target = "Immediately"
+    elif suggested_priority == "High":
+        response_target = "Within 1 hour"
+    elif suggested_priority == "Medium":
+        response_target = "Within 4 business hours"
+    else:
+        response_target = "Within 1 business day"
+
+    if category == "Network":
+        checks = [
+            "Confirm whether the issue affects one device, one location or multiple teams.",
+            "Capture the affected network/VPN, exact time, error message and connection type.",
+            "Check approved service-health and network-monitoring dashboards before changing configuration.",
+        ]
+    elif category == "Access":
+        checks = [
+            "Verify the user's identity through the approved company process.",
+            "Check account status, assigned role and recent access changes.",
+            "Never ask for passwords, MFA codes or recovery codes; use the approved account-recovery workflow.",
+        ]
+    elif category == "Email":
+        checks = [
+            "Establish whether sending, receiving or both are affected and identify the affected mailboxes.",
+            "Capture one example timestamp and message ID, where available.",
+            "Check approved mail-service health and message-trace tools.",
+        ]
+    elif category == "Hardware":
+        checks = [
+            "Record the device asset tag, model and assigned user.",
+            "Check power, cabling, peripherals and any visible error indicators.",
+            "Confirm whether a safe restart or known-good peripheral test is appropriate.",
+        ]
+    elif category == "Software":
+        checks = [
+            "Record the application version, device and exact error or failing workflow.",
+            "Check recent releases, maintenance notices and known issues.",
+            "Compare whether the problem affects one user or multiple users before changing settings.",
+        ]
+    else:
+        checks = [
+            "Confirm the affected users, device/service and business workflow.",
+            "Record when the problem started and capture the exact error message.",
+            "Check recent changes and known service issues before attempting a fix.",
+        ]
+
+    if any(signal["label"] == "Security signal" for signal in signals):
+        checks = [
+            "Do not approve unexpected MFA prompts or open suspicious links or attachments.",
+            "Preserve the alert details and notify the authorised security contact immediately.",
+            "Follow the organisation's incident-response procedure; do not attempt ad-hoc evidence cleanup.",
+        ] + checks[:1]
+
+    article_matches = match_knowledge_articles(db, f"{title} {description}", category)
+    return {
+        "title": title,
+        "category": category,
+        "suggested_priority": suggested_priority,
+        "reason": reason,
+        "response_target": response_target,
+        "signals": signals,
+        "checks": checks,
+        "articles": article_matches,
+        "review_note": "Decision support only. A human IT responder must confirm impact, urgency and the appropriate response with the requester and your IT/security process.",
+        "method": "Transparent keyword and category rules",
+    }
+
+
+RECURRING_THEMES = (
+    ("VPN & connectivity", ("vpn", "wifi", "wi-fi", "network", "connection", "disconnect", "dns", "internet", "latency")),
+    ("Access & identity", ("access", "login", "locked", "mfa", "authenticator", "password", "permission", "sign-in", "signin")),
+    ("Email & messaging", ("email", "mail", "outlook", "delivery", "mailbox", "calendar")),
+    ("Devices & hardware", ("laptop", "printer", "keyboard", "monitor", "device", "display", "hardware", "screen")),
+    ("Business applications", ("application", "software", "crm", "portal", "licence", "license", "install", "crash")),
+    ("Security review", ("suspicious", "phishing", "ransomware", "breach", "malware", "security", "unauthorised", "unauthorized")),
+)
+
+
+def detect_recurring_incidents(
+    tickets: list[sqlite3.Row] | list[dict], days: int = 90
+) -> list[dict]:
+    """Group incidents by explicit keyword themes; results are signals, not duplicate verdicts."""
+    now = datetime.now()
+    cutoff = now - timedelta(days=days)
+    groups: dict[str, list[dict]] = {}
+    for ticket in tickets:
+        try:
+            created = datetime.fromisoformat(ticket["created_at"])
+        except (TypeError, ValueError):
+            continue
+        if created < cutoff or created > now:
+            continue
+        text = f"{ticket['title']} {ticket['description']}".lower()
+        matches = []
+        for label, keywords in RECURRING_THEMES:
+            hits = [word for word in keywords if word in text]
+            if hits:
+                matches.append((len(hits), label, hits))
+        if not matches:
+            category = ticket["category"]
+            if category in ("Network", "Access", "Email", "Hardware", "Software"):
+                matches = [(1, f"{category} support", [category.lower()])]
+        if not matches:
+            continue
+        _score, label, hits = sorted(matches, key=lambda item: (-item[0], item[1]))[0]
+        groups.setdefault(label, []).append({
+            "id": ticket["id"],
+            "title": ticket["title"],
+            "status": ticket["status"],
+            "priority": ticket["priority"],
+            "assignee": ticket["assignee"],
+            "matched_terms": hits,
+        })
+
+    patterns = []
+    for label, items in groups.items():
+        if len(items) < 2:
+            continue
+        patterns.append({
+            "theme": label,
+            "count": len(items),
+            "open_count": sum(item["status"] != "Resolved" for item in items),
+            "critical_count": sum(item["priority"] == "Critical" and item["status"] != "Resolved" for item in items),
+            "ticket_ids": [item["id"] for item in items],
+            "samples": items[:3],
+            "matched_terms": sorted({term for item in items for term in item["matched_terms"]})[:8],
+        })
+    patterns.sort(key=lambda item: (-item["open_count"], -item["count"], item["theme"]))
+    return patterns[:6]
+
+
+def build_daily_operations_summary(db: sqlite3.Connection) -> dict:
+    """Summarise today's actual ticket and activity records using local server time."""
+    today = datetime.now().date()
+    tickets = db.execute("SELECT * FROM tickets ORDER BY created_at DESC").fetchall()
+
+    def day_of(value: str | None):
+        try:
+            return datetime.fromisoformat(value).date() if value else None
+        except (TypeError, ValueError):
+            return None
+
+    created_today = [ticket for ticket in tickets if day_of(ticket["created_at"]) == today]
+    resolved_today = [
+        ticket for ticket in tickets
+        if ticket["status"] == "Resolved"
+        and day_of(ticket["resolved_at"] or ticket["updated_at"]) == today
+    ]
+    active = [ticket for ticket in tickets if ticket["status"] != "Resolved"]
+    overdue = [ticket for ticket in active if ticket_sla(ticket) == "breached"]
+    critical = [ticket for ticket in active if ticket["priority"] == "Critical"]
+    unassigned = [ticket for ticket in active if (ticket["assignee"] or "").strip().lower() == "unassigned"]
+    patterns = detect_recurring_incidents(tickets, 90)
+    activity = db.execute("SELECT * FROM activity ORDER BY id DESC LIMIT 6").fetchall()
+
+    category_counts: dict[str, int] = {}
+    for ticket in active:
+        category_counts[ticket["category"]] = category_counts.get(ticket["category"], 0) + 1
+    top_category = max(category_counts, key=category_counts.get) if category_counts else "None"
+
+    highlights = []
+    if critical:
+        highlights.append(f"{len(critical)} active critical incident(s) need immediate human review.")
+    if overdue:
+        highlights.append(f"{len(overdue)} active incident(s) are past their SLA due time.")
+    if unassigned:
+        highlights.append(f"{len(unassigned)} active incident(s) do not have an assignee.")
+    if patterns:
+        highlights.append(f"{len(patterns)} recurring theme(s) appear in the 90-day incident sample.")
+    if not highlights:
+        highlights.append("No critical, overdue or unassigned incidents were found in the current register.")
+
+    return {
+        "date_label": today.strftime("%A, %d %B %Y"),
+        "total": len(tickets),
+        "created_today": len(created_today),
+        "resolved_today": len(resolved_today),
+        "active": len(active),
+        "critical": len(critical),
+        "overdue": len(overdue),
+        "unassigned": len(unassigned),
+        "top_category": top_category,
+        "patterns": patterns,
+        "highlights": highlights,
+        "activity": [dict(item) for item in activity],
+    }
 
 
 def init_db() -> None:
@@ -1120,6 +1393,77 @@ def build_analytics(days: int = 30) -> dict:
             "resolved": percentage_change(current_resolved, previous_resolved),
         },
     }
+
+
+@app.route("/assistant", methods=["GET", "POST"])
+@roles_required("Admin", "IT Agent")
+def smart_assistant():
+    db = get_db()
+    form_data = {"title": "", "description": "", "category": "Other"}
+    analysis = None
+
+    if request.method == "POST":
+        form_data["title"] = request.form.get("title", "").strip()[:140]
+        form_data["description"] = request.form.get("description", "").strip()[:2000]
+        form_data["category"] = request.form.get("category", "Other")
+        if not form_data["title"]:
+            flash("Add an incident title so Pulse Assist has something to analyse.", "error")
+        else:
+            analysis = analyse_incident(
+                db, form_data["title"], form_data["description"], form_data["category"]
+            )
+    else:
+        ticket_id = request.args.get("ticket_id", type=int)
+        if ticket_id:
+            ticket = db.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+            if ticket:
+                form_data = {
+                    "title": ticket["title"],
+                    "description": ticket["description"],
+                    "category": ticket["category"] if ticket["category"] in CATEGORIES else "Other",
+                }
+                analysis = analyse_incident(
+                    db, form_data["title"], form_data["description"], form_data["category"]
+                )
+
+    summary = build_daily_operations_summary(db)
+    return render_template(
+        "assistant.html", active_page="assistant", analysis=analysis,
+        form_data=form_data, summary=summary,
+    )
+
+
+@app.post("/api/assistant/analyze")
+@roles_required("Admin", "IT Agent")
+def assistant_analyze_api():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Expected a JSON object describing the incident."}), 400
+    title = str(payload.get("title", "")).strip()[:140]
+    description = str(payload.get("description", "")).strip()[:2000]
+    category = str(payload.get("category", "Other"))
+    if not title:
+        return jsonify({"error": "An incident title is required."}), 400
+    result = analyse_incident(get_db(), title, description, category)
+    return jsonify(result)
+
+
+@app.route("/api/assistant/summary")
+@roles_required("Admin", "IT Agent")
+def assistant_summary_api():
+    return jsonify(build_daily_operations_summary(get_db()))
+
+
+@app.route("/api/assistant/recurrences")
+@roles_required("Admin", "IT Agent")
+def assistant_recurrences_api():
+    try:
+        days = int(request.args.get("days", "90"))
+    except (TypeError, ValueError):
+        days = 90
+    days = min(365, max(7, days))
+    tickets = get_db().execute("SELECT * FROM tickets ORDER BY created_at DESC").fetchall()
+    return jsonify({"days": days, "patterns": detect_recurring_incidents(tickets, days)})
 
 
 @app.route("/reports")
