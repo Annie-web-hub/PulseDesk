@@ -411,7 +411,7 @@ class PulseDeskTests(unittest.TestCase):
             "serial_number": "SN-TEST-999", "vendor": "Example Devices",
             "purchase_date": "2026-10-01", "purchase_cost": "1499.95",
             "location": "Floor 2 · Desk 14", "maintenance_interval_days": "180",
-            "next_maintenance_at": "2027-01-01", "notes": "Demo lifecycle record.",
+            "notes": "Demo lifecycle record.",
         }, follow_redirects=True)
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"AST-999", response.data)
@@ -431,7 +431,7 @@ class PulseDeskTests(unittest.TestCase):
         self.assertEqual(row, (
             "Test laptop", "Taylor Reed", "SN-TEST-999", "Example Devices",
             "2026-10-01", 1499.95, "Floor 2 · Desk 14", "2028-01-01",
-            "2027-01-01", "Demo lifecycle record.",
+            "", "Demo lifecycle record.",
         ))
         self.assertEqual(event, ("Asset registered", "Alex Morgan"))
         self.assertEqual(audit[0], "Asset registered")
@@ -444,7 +444,6 @@ class PulseDeskTests(unittest.TestCase):
             "serial_number": "MBP-001", "vendor": "Apple",
             "purchase_date": "2025-08-12", "purchase_cost": "1899.00",
             "warranty_until": "2027-08-12", "location": "IT Workshop",
-            "next_maintenance_at": "2026-12-01",
             "maintenance_interval_days": "120",
             "notes": "Battery diagnostics required.",
         }, follow_redirects=True)
@@ -462,6 +461,63 @@ class PulseDeskTests(unittest.TestCase):
         self.assertEqual(event[0], "Asset details updated")
         self.assertIn("assigned to", event[1])
         self.assertIn("status", event[1])
+
+    def test_asset_maintenance_interval_prefills_schedule_date_and_is_not_directly_editable(self):
+        response = self.client.get("/assets/1")
+        self.assertEqual(response.status_code, 200)
+        due_suggestion = (datetime.now().date() + timedelta(days=180)).isoformat()
+        self.assertIn(f'name="due_at" type="date"'.encode(), response.data)
+        self.assertIn(f'value="{due_suggestion}"'.encode(), response.data)
+        self.assertNotIn(b'name="next_maintenance_at"', response.data)
+
+    def test_invalid_asset_type_and_non_finite_purchase_cost_are_rejected(self):
+        for tag, asset_type, cost in (
+            ("AST-BADTYPE", "Spaceship", "100.00"),
+            ("AST-BADCOST", "Laptop", "NaN"),
+        ):
+            self.post("/assets", {
+                "asset_tag": tag, "name": "Invalid asset", "asset_type": asset_type,
+                "purchase_cost": cost, "status": "In stock",
+            }, follow_redirects=True)
+        with sqlite3.connect(self.db_path) as db:
+            rejected = db.execute(
+                "SELECT COUNT(*) FROM assets WHERE asset_tag IN ('AST-BADTYPE','AST-BADCOST')"
+            ).fetchone()[0]
+        self.assertEqual(rejected, 0)
+
+    def test_retiring_an_asset_cancels_scheduled_maintenance(self):
+        with sqlite3.connect(self.db_path) as db:
+            scheduled_before = db.execute(
+                "SELECT COUNT(*) FROM asset_maintenance WHERE asset_id=1 AND status='Scheduled'"
+            ).fetchone()[0]
+        self.assertGreater(scheduled_before, 0)
+        response = self.post("/assets/1", {
+            "name": "MacBook Pro 14", "asset_type": "Laptop",
+            "assigned_to": "Maya Patel", "department": "Sales",
+            "status": "Retired", "serial_number": "", "vendor": "",
+            "purchase_date": "", "purchase_cost": "",
+            "warranty_until": "2027-08-12", "location": "",
+            "maintenance_interval_days": "180", "notes": "",
+        }, follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Cancelled because the asset was retired", response.data)
+        with sqlite3.connect(self.db_path) as db:
+            statuses = db.execute(
+                "SELECT DISTINCT status FROM asset_maintenance WHERE asset_id=1"
+            ).fetchall()
+            next_due = db.execute("SELECT next_maintenance_at FROM assets WHERE id=1").fetchone()[0]
+            event = db.execute(
+                "SELECT action FROM asset_events WHERE asset_id=1 ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        self.assertEqual(statuses, [("Cancelled",)])
+        self.assertEqual(next_due, "")
+        self.assertEqual(event, "Asset details updated")
+        with sqlite3.connect(self.db_path) as db:
+            self.assertGreater(
+                db.execute(
+                    "SELECT COUNT(*) FROM asset_events WHERE asset_id=1 AND action='Maintenance cancelled'"
+                ).fetchone()[0], 0
+            )
 
     def test_asset_maintenance_schedule_completion_and_next_due_recalculation(self):
         self.post("/assets", {
@@ -586,6 +642,36 @@ class PulseDeskTests(unittest.TestCase):
         self.assertEqual(employee.post("/assets/1/maintenance", data={
             "task": "Unauthorised", "due_at": "2027-01-01", "csrf_token": csrf,
         }).status_code, 403)
+
+    def test_legacy_maintenance_date_migrates_into_planner_once(self):
+        legacy_due = (datetime.now().date() + timedelta(days=45)).isoformat()
+        with sqlite3.connect(self.db_path) as db:
+            db.execute(
+                "UPDATE assets SET next_maintenance_at=? WHERE id=8",
+                (legacy_due,),
+            )
+            db.commit()
+        init_db()
+        with sqlite3.connect(self.db_path) as db:
+            task = db.execute(
+                """SELECT task, due_at, status FROM asset_maintenance
+                WHERE asset_id=8 AND task='Imported maintenance reminder'"""
+            ).fetchone()
+            event_count = db.execute(
+                """SELECT COUNT(*) FROM asset_events
+                WHERE asset_id=8 AND action='Maintenance scheduled'
+                AND summary=?""",
+                (f"Imported maintenance reminder · due {legacy_due}",),
+            ).fetchone()[0]
+        self.assertEqual(task, ("Imported maintenance reminder", legacy_due, "Scheduled"))
+        self.assertEqual(event_count, 1)
+        init_db()
+        with sqlite3.connect(self.db_path) as db:
+            repeated_count = db.execute(
+                """SELECT COUNT(*) FROM asset_maintenance
+                WHERE asset_id=8 AND task='Imported maintenance reminder'"""
+            ).fetchone()[0]
+        self.assertEqual(repeated_count, 1)
 
     def test_existing_assets_receive_one_baseline_history_entry_without_duplicate_migration(self):
         with sqlite3.connect(self.db_path) as db:
@@ -1023,9 +1109,15 @@ class PulseDeskTests(unittest.TestCase):
         }).status_code, 403)
 
     def test_sla_workflow_escalates_one_configured_stage_per_manual_run(self):
+        # Use the previous weekday's opening time so stage 3 has at least 90
+        # business minutes available regardless of the clock time running the suite.
         now = datetime.now().replace(microsecond=0)
-        created = (now - timedelta(hours=10)).isoformat(timespec="seconds")
-        due = (now - timedelta(hours=8)).isoformat(timespec="seconds")
+        due_day = now.date() - timedelta(days=1)
+        while due_day.weekday() >= 5:
+            due_day -= timedelta(days=1)
+        due_at = datetime.combine(due_day, datetime.min.time()) + timedelta(hours=9)
+        created = (due_at - timedelta(hours=10)).isoformat(timespec="seconds")
+        due = due_at.isoformat(timespec="seconds")
         with sqlite3.connect(self.db_path) as db:
             cursor = db.execute(
                 """INSERT INTO tickets

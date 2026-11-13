@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -42,6 +43,7 @@ STATUSES = ("Open", "In Progress", "Waiting", "Resolved")
 PRIORITIES = ("Low", "Medium", "High", "Critical")
 CATEGORIES = ("Hardware", "Software", "Access", "Network", "Email", "Other")
 ASSET_STATUSES = ("In use", "In repair", "In stock", "Retired")
+ASSET_TYPES = ("Laptop", "Mobile", "Monitor", "Printer", "Tablet", "Other")
 ROLES = ("Admin", "IT Agent", "Employee")
 ESCALATION_TARGETS = {1: "Service Lead", 2: "IT Manager", 3: "Incident Manager"}
 DEMO_ACCOUNTS = (
@@ -1145,6 +1147,21 @@ def init_db() -> None:
                         "UPDATE assets SET next_maintenance_at=?, updated_at=? WHERE id=?",
                         (due, now_iso(), asset["id"]),
                     )
+        # Preserve maintenance dates entered by the earlier asset form by turning
+        # them into visible planner tasks rather than orphaned date fields.
+        db.execute(
+            """INSERT INTO asset_maintenance
+            (asset_id, task, due_at, status, created_at)
+            SELECT a.id, 'Imported maintenance reminder', a.next_maintenance_at,
+                'Scheduled', ?
+            FROM assets a
+            WHERE a.status != 'Retired' AND a.next_maintenance_at != ''
+            AND NOT EXISTS (
+                SELECT 1 FROM asset_maintenance m
+                WHERE m.asset_id=a.id AND m.status='Scheduled'
+            )""",
+            (now_iso(),),
+        )
         db.execute(
             """INSERT INTO asset_events
             (asset_id, action, summary, actor_id, actor_name, metadata_json, created_at)
@@ -1421,6 +1438,7 @@ def inject_globals():
         "ticket_priorities": PRIORITIES,
         "ticket_categories": CATEGORIES,
         "asset_statuses": ASSET_STATUSES,
+        "asset_types": ASSET_TYPES,
     }
 
 
@@ -1647,18 +1665,19 @@ def assets_page():
         vendor = request.form.get("vendor", "").strip()[:100]
         purchase_date = request.form.get("purchase_date", "").strip()
         location = request.form.get("location", "").strip()[:120]
-        next_maintenance = request.form.get("next_maintenance_at", "").strip()
         notes = request.form.get("notes", "").strip()[:2000]
         try:
             purchase_cost = float(request.form.get("purchase_cost", "").strip()) if request.form.get("purchase_cost", "").strip() else None
             interval = int(request.form.get("maintenance_interval_days", "180"))
-            for label, value in (("Warranty end", warranty), ("Purchase date", purchase_date), ("Next maintenance", next_maintenance)):
+            for label, value in (("Warranty end", warranty), ("Purchase date", purchase_date)):
                 if value:
                     datetime.fromisoformat(value)
         except (TypeError, ValueError):
             flash("Enter valid dates, a numeric purchase cost and a whole-number maintenance interval.", "error")
             return redirect(url_for("assets_page"))
-        if not tag or not name or status not in ASSET_STATUSES or purchase_cost is not None and purchase_cost < 0 or not 1 <= interval <= 3650:
+        if (not tag or not name or status not in ASSET_STATUSES or asset_type not in ASSET_TYPES
+                or purchase_cost is not None and (not math.isfinite(purchase_cost) or purchase_cost < 0)
+                or not 1 <= interval <= 3650):
             flash("Check the required asset details, purchase cost and maintenance interval (1–3,650 days).", "error")
             return redirect(url_for("assets_page"))
         try:
@@ -1667,9 +1686,9 @@ def assets_page():
                 (asset_tag, name, asset_type, assigned_to, department, status, warranty_until,
                  serial_number, vendor, purchase_date, purchase_cost, location, notes,
                  next_maintenance_at, maintenance_interval_days, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)""",
                 (tag, name, asset_type, assigned, department, status, warranty, serial, vendor,
-                 purchase_date, purchase_cost, location, notes, next_maintenance, interval, now_iso()),
+                 purchase_date, purchase_cost, location, notes, interval, now_iso()),
             )
             asset_id = cursor.lastrowid
             write_asset_event(
@@ -1805,18 +1824,19 @@ def asset_detail(asset_id: int):
         warranty = request.form.get("warranty_until", "").strip()
         location = request.form.get("location", "").strip()[:120]
         notes = request.form.get("notes", "").strip()[:2000]
-        next_maintenance = request.form.get("next_maintenance_at", "").strip()
         try:
             cost_text = request.form.get("purchase_cost", "").strip()
             purchase_cost = float(cost_text) if cost_text else None
             interval = int(request.form.get("maintenance_interval_days", "180"))
-            for label, value in (("Purchase date", purchase_date), ("Warranty end", warranty), ("Next maintenance", next_maintenance)):
+            for label, value in (("Purchase date", purchase_date), ("Warranty end", warranty)):
                 if value:
                     datetime.fromisoformat(value)
         except (TypeError, ValueError):
             flash("Enter valid dates, a numeric purchase cost and a whole-number maintenance interval.", "error")
             return redirect(url_for("asset_detail", asset_id=asset_id))
-        if not name or status not in ASSET_STATUSES or purchase_cost is not None and purchase_cost < 0 or not 1 <= interval <= 3650:
+        if (not name or status not in ASSET_STATUSES or asset_type not in ASSET_TYPES
+                or purchase_cost is not None and (not math.isfinite(purchase_cost) or purchase_cost < 0)
+                or not 1 <= interval <= 3650):
             flash("Check the asset details, purchase cost and maintenance interval.", "error")
             return redirect(url_for("asset_detail", asset_id=asset_id))
         new_values = {
@@ -1824,7 +1844,7 @@ def asset_detail(asset_id: int):
             "department": department, "status": status, "serial_number": serial,
             "vendor": vendor, "purchase_date": purchase_date, "purchase_cost": purchase_cost,
             "warranty_until": warranty, "location": location, "notes": notes,
-            "next_maintenance_at": next_maintenance, "maintenance_interval_days": interval,
+            "maintenance_interval_days": interval,
         }
         changes = {
             field: {"from": asset[field], "to": value}
@@ -1834,11 +1854,32 @@ def asset_detail(asset_id: int):
         db.execute(
             """UPDATE assets SET name=?, asset_type=?, assigned_to=?, department=?, status=?,
             serial_number=?, vendor=?, purchase_date=?, purchase_cost=?, warranty_until=?,
-            location=?, notes=?, next_maintenance_at=?, maintenance_interval_days=?, updated_at=?
+            location=?, notes=?, maintenance_interval_days=?, updated_at=?
             WHERE id=?""",
             (name, asset_type, assigned, department, status, serial, vendor, purchase_date,
-             purchase_cost, warranty, location, notes, next_maintenance, interval, now_iso(), asset_id),
+             purchase_cost, warranty, location, notes, interval, now_iso(), asset_id),
         )
+        if status == "Retired" and asset["status"] != "Retired":
+            scheduled = db.execute(
+                "SELECT id, task, due_at FROM asset_maintenance WHERE asset_id=? AND status='Scheduled'",
+                (asset_id,),
+            ).fetchall()
+            for item in scheduled:
+                cancellation_note = "Cancelled because the asset was retired."
+                db.execute(
+                    "UPDATE asset_maintenance SET status='Cancelled', outcome=? WHERE id=? AND status='Scheduled'",
+                    (cancellation_note, item["id"]),
+                )
+                write_asset_event(
+                    db, asset_id, "Maintenance cancelled",
+                    f"{item['task']} · {cancellation_note}",
+                    g.user["id"], g.user["full_name"],
+                    {"maintenance_id": item["id"], "due_at": item["due_at"], "reason": "asset_retired"},
+                )
+            db.execute(
+                "UPDATE assets SET next_maintenance_at='', updated_at=? WHERE id=?",
+                (now_iso(), asset_id),
+            )
         if changes:
             fragments = []
             for field, value in changes.items():
@@ -1855,6 +1896,9 @@ def asset_detail(asset_id: int):
         return redirect(url_for("asset_detail", asset_id=asset_id))
 
     asset = decorate_asset(asset)
+    default_maintenance_date = (
+        datetime.now().date() + timedelta(days=asset["maintenance_interval_days"])
+    ).isoformat()
     events = db.execute(
         "SELECT * FROM asset_events WHERE asset_id=? ORDER BY id DESC LIMIT 30", (asset_id,)
     ).fetchall()
@@ -1869,6 +1913,7 @@ def asset_detail(asset_id: int):
     return render_template(
         "asset_detail.html", active_page="assets", asset=asset,
         events=events, maintenance=maintenance,
+        default_maintenance_date=default_maintenance_date,
     )
 
 

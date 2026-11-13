@@ -112,9 +112,9 @@ Audit events are append-only at the application/database level: SQLite triggers 
 
 Every asset now has procurement and lifecycle fields for serial number, vendor, purchase date, purchase cost in EUR, location, notes, warranty end, maintenance interval and next scheduled maintenance. Existing inventory rows are migrated in place; asset IDs, tags and existing ownership/status values are retained.
 
-The asset register highlights warranties expiring within 60 days, expired warranties, maintenance due today or earlier, maintenance scheduled within 60 days, and unassigned devices. Filters open the matching watchlists. The dashboard's quick-deploy tile includes the current number of devices needing attention.
+The asset register highlights warranties expiring within 60 days, expired warranties, maintenance due today or earlier, maintenance scheduled within 60 days, and unassigned devices. Filters open the matching watchlists. The dashboard's quick-deploy tile includes the current number of attention flags. The maintenance date shown in the register is derived from scheduled maintenance tasks, while the asset's default interval pre-fills a suggested date in the planner.
 
-Open an asset to edit its profile, schedule maintenance, record work performed and inspect its timeline. Completing a maintenance task stores the outcome and recalculates the device's next maintenance date from its remaining scheduled tasks. A scheduled task cannot be completed twice. The asset timeline is append-only via SQLite triggers and its events are also mirrored into the global audit log.
+Open an asset to edit its profile, schedule maintenance, record work performed and inspect its timeline. Completing a maintenance task stores the outcome and recalculates the device's next maintenance date from its remaining scheduled tasks. The default maintenance interval suggests a date when a new task is created; it does not silently create recurring work. Retiring an asset cancels its outstanding scheduled maintenance and records each cancellation. A scheduled task cannot be completed twice. The asset timeline is append-only via SQLite triggers and its events are also mirrored into the global audit log.
 
 The first lifecycle migration creates one baseline history event for each pre-existing device. Demo records also include a few upcoming maintenance tasks to make the planner explorable after setup. Maintenance and warranty dates currently surface in the register; automatic email reminders, vendor integrations, depreciation schedules and file attachments are not included yet.
 
@@ -187,6 +187,22 @@ These credentials are intentionally predictable for a portfolio demonstration. *
 
 Each escalation records the target level, reason, acting user and timestamp. Resolved incidents cannot be escalated, reasons are required, and the workflow stops at level 3.
 
+## Portfolio walkthrough
+
+Use the seeded Admin account for a short guided demonstration. A five-minute walkthrough is more persuasive than clicking through every page:
+
+1. **Incident operations:** create a test incident, show the rule-based priority suggestion, update its owner/status and inspect the incident history.
+2. **Pulse Assist:** analyse a sample issue, review its impact signals and runbook matches, then show the recurrence radar and daily operations brief.
+3. **Service control:** open the SLA workflow matrix, show the business-hours clock, inspect the audit log and review worker health in Monitoring. Keep scheduled escalation paused for the demo.
+4. **Operational insight:** change the analytics reporting window, explain the metrics and download a CSV export.
+5. **Asset lifecycle:** open a device, schedule maintenance using the suggested interval, record a completion outcome and inspect the asset timeline.
+
+Use fictional records only. Pulse Assist is a transparent keyword/rule engine rather than a trained AI model; SMTP remains in preview mode until provider settings are configured. Those limitations are documented intentionally rather than hidden.
+
+## Quality gates
+
+The repository includes a GitHub Actions workflow at `.github/workflows/ci.yml`. On pushes and pull requests to `main`, it compiles Python modules, checks both JavaScript files and runs the full unittest integration suite using Python 3.12.
+
 ## Run locally
 
 Requires Python 3.10 or newer.
@@ -240,6 +256,9 @@ Each test uses an isolated temporary database for its test actions. Importing th
 
 ```
 pulsedesk/
+├── .github/
+│   └── workflows/
+│       └── ci.yml          # Python and JavaScript checks on push / pull request
 ├── app.py                  # Flask routes, auth, permissions and data logic
 ├── instance/               # Local SQLite database and generated secret (ignored)
 ├── static/
