@@ -540,6 +540,98 @@ def write_audit_event(
     )
 
 
+def write_asset_event(
+    db: sqlite3.Connection,
+    asset_id: int,
+    action: str,
+    summary: str,
+    actor_id: int | None,
+    actor_name: str,
+    metadata: dict | None = None,
+) -> None:
+    """Append an immutable lifecycle event and mirror it to the global audit register."""
+    payload = metadata or {}
+    db.execute(
+        """INSERT INTO asset_events
+        (asset_id, action, summary, actor_id, actor_name, metadata_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (asset_id, action[:60], summary[:1000], actor_id, actor_name[:100],
+         json.dumps(payload, ensure_ascii=False)[:4000], now_iso()),
+    )
+    write_audit_event(
+        db, "asset", asset_id, action, summary, actor_id, actor_name, payload
+    )
+
+
+def asset_lifecycle_metrics(db: sqlite3.Connection) -> dict:
+    today = datetime.now().date()
+    horizon = (today + timedelta(days=60)).isoformat()
+    current = today.isoformat()
+    expiring = db.execute(
+        """SELECT COUNT(*) FROM assets
+        WHERE warranty_until != '' AND warranty_until >= ? AND warranty_until <= ? AND status != 'Retired'""",
+        (current, horizon),
+    ).fetchone()[0]
+    expired = db.execute(
+        """SELECT COUNT(*) FROM assets
+        WHERE warranty_until != '' AND warranty_until < ? AND status != 'Retired'""",
+        (current,),
+    ).fetchone()[0]
+    maintenance_due = db.execute(
+        """SELECT COUNT(*) FROM assets
+        WHERE status != 'Retired' AND next_maintenance_at != '' AND next_maintenance_at <= ?""",
+        (current,),
+    ).fetchone()[0]
+    maintenance_upcoming = db.execute(
+        """SELECT COUNT(*) FROM assets
+        WHERE status != 'Retired' AND next_maintenance_at > ? AND next_maintenance_at <= ?""",
+        (current, horizon),
+    ).fetchone()[0]
+    unassigned = db.execute(
+        "SELECT COUNT(*) FROM assets WHERE assigned_to='Unassigned' AND status != 'Retired'"
+    ).fetchone()[0]
+    return {
+        "total": db.execute("SELECT COUNT(*) FROM assets").fetchone()[0],
+        "in_use": db.execute("SELECT COUNT(*) FROM assets WHERE status='In use'").fetchone()[0],
+        "in_stock": db.execute("SELECT COUNT(*) FROM assets WHERE status='In stock'").fetchone()[0],
+        "in_repair": db.execute("SELECT COUNT(*) FROM assets WHERE status='In repair'").fetchone()[0],
+        "retired": db.execute("SELECT COUNT(*) FROM assets WHERE status='Retired'").fetchone()[0],
+        "warranty_expiring": expiring,
+        "warranty_expired": expired,
+        "maintenance_due": maintenance_due,
+        "maintenance_upcoming": maintenance_upcoming,
+        "unassigned": unassigned,
+    }
+
+
+def decorate_asset(asset: sqlite3.Row | dict) -> dict:
+    item = dict(asset)
+    today = datetime.now().date()
+    warranty_state = "unknown"
+    warranty_days = None
+    if item.get("warranty_until"):
+        try:
+            warranty_date = datetime.fromisoformat(item["warranty_until"]).date()
+            warranty_days = (warranty_date - today).days
+            warranty_state = "expired" if warranty_days < 0 else ("expiring" if warranty_days <= 60 else "active")
+        except (TypeError, ValueError):
+            warranty_state = "invalid"
+    maintenance_state = "not-scheduled"
+    maintenance_days = None
+    if item.get("next_maintenance_at"):
+        try:
+            maintenance_date = datetime.fromisoformat(item["next_maintenance_at"]).date()
+            maintenance_days = (maintenance_date - today).days
+            maintenance_state = "due" if maintenance_days <= 0 else ("upcoming" if maintenance_days <= 30 else "scheduled")
+        except (TypeError, ValueError):
+            maintenance_state = "invalid"
+    item["warranty_state"] = warranty_state
+    item["warranty_days"] = warranty_days
+    item["maintenance_state"] = maintenance_state
+    item["maintenance_days"] = maintenance_days
+    return item
+
+
 def default_workflow_rules() -> list[tuple[str, int, int, str]]:
     return [
         ("Critical", 1, 0, ESCALATION_TARGETS[1]),
@@ -846,7 +938,38 @@ def init_db() -> None:
                 assigned_to TEXT NOT NULL DEFAULT 'Unassigned',
                 department TEXT NOT NULL DEFAULT 'Operations',
                 status TEXT NOT NULL DEFAULT 'In stock',
-                warranty_until TEXT NOT NULL DEFAULT ''
+                warranty_until TEXT NOT NULL DEFAULT '',
+                serial_number TEXT NOT NULL DEFAULT '',
+                vendor TEXT NOT NULL DEFAULT '',
+                purchase_date TEXT NOT NULL DEFAULT '',
+                purchase_cost REAL,
+                location TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                next_maintenance_at TEXT NOT NULL DEFAULT '',
+                maintenance_interval_days INTEGER NOT NULL DEFAULT 180,
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS asset_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+                action TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                actor_id INTEGER REFERENCES users(id),
+                actor_name TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS asset_maintenance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+                task TEXT NOT NULL,
+                due_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Scheduled' CHECK(status IN ('Scheduled','Completed','Cancelled')),
+                outcome TEXT NOT NULL DEFAULT '',
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                completed_by INTEGER REFERENCES users(id),
+                completed_at TEXT
             );
             CREATE TABLE IF NOT EXISTS articles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -921,6 +1044,14 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_email_outbox_created ON email_outbox(created_at);
             CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id, id);
             CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_asset_events_asset ON asset_events(asset_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_asset_maintenance_due ON asset_maintenance(status, due_at);
+            CREATE TRIGGER IF NOT EXISTS asset_events_no_update
+            BEFORE UPDATE ON asset_events
+            BEGIN SELECT RAISE(ABORT, 'Asset events are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS asset_events_no_delete
+            BEFORE DELETE ON asset_events
+            BEGIN SELECT RAISE(ABORT, 'Asset events are immutable'); END;
             CREATE TRIGGER IF NOT EXISTS audit_events_no_update
             BEFORE UPDATE ON audit_events
             BEGIN SELECT RAISE(ABORT, 'Audit events are immutable'); END;
@@ -929,6 +1060,29 @@ def init_db() -> None:
             BEGIN SELECT RAISE(ABORT, 'Audit events are immutable'); END;
             """
         )
+        asset_columns = {row["name"] for row in db.execute("PRAGMA table_info(assets)")}
+        asset_migrations = (
+            ("serial_number", "TEXT NOT NULL DEFAULT ''"),
+            ("vendor", "TEXT NOT NULL DEFAULT ''"),
+            ("purchase_date", "TEXT NOT NULL DEFAULT ''"),
+            ("purchase_cost", "REAL"),
+            ("location", "TEXT NOT NULL DEFAULT ''"),
+            ("notes", "TEXT NOT NULL DEFAULT ''"),
+            ("next_maintenance_at", "TEXT NOT NULL DEFAULT ''"),
+            ("maintenance_interval_days", "INTEGER NOT NULL DEFAULT 180"),
+            ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+        )
+        for column_name, column_type in asset_migrations:
+            if column_name not in asset_columns:
+                db.execute(f"ALTER TABLE assets ADD COLUMN {column_name} {column_type}")
+        db.execute(
+            "INSERT INTO asset_events (asset_id, action, summary, actor_id, actor_name, metadata_json, created_at) "
+            "SELECT a.id, 'Inventory baseline', 'Existing inventory record imported into lifecycle tracking.', "
+            "NULL, 'PulseDesk Migration', '{}', ? FROM assets a "
+            "WHERE NOT EXISTS (SELECT 1 FROM asset_events e WHERE e.asset_id=a.id)",
+            (now_iso(),),
+        )
+
         ticket_columns = {row["name"] for row in db.execute("PRAGMA table_info(tickets)")}
         if "created_by" not in ticket_columns:
             db.execute("ALTER TABLE tickets ADD COLUMN created_by INTEGER REFERENCES users(id)")
@@ -964,6 +1118,46 @@ def init_db() -> None:
             )
         if db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0] == 0:
             seed_demo_data(db)
+        db.execute(
+            "INSERT INTO asset_events (asset_id, action, summary, actor_id, actor_name, metadata_json, created_at) "
+            "SELECT a.id, 'Inventory baseline', 'Existing inventory record imported into lifecycle tracking.', "
+            "NULL, 'PulseDesk Migration', '{}', ? FROM assets a "
+            "WHERE NOT EXISTS (SELECT 1 FROM asset_events e WHERE e.asset_id=a.id)",
+            (now_iso(),),
+        )
+        if db.execute("SELECT COUNT(*) FROM asset_maintenance").fetchone()[0] == 0:
+            demo_maintenance = (
+                ("AST-001", "Endpoint health and security check", 14),
+                ("AST-004", "Battery health and device diagnostics", 30),
+                ("AST-006", "Printer roller and paper-feed inspection", 7),
+            )
+            for tag, task, days_ahead in demo_maintenance:
+                asset = db.execute("SELECT id FROM assets WHERE asset_tag=?", (tag,)).fetchone()
+                if asset:
+                    due = (datetime.now().date() + timedelta(days=days_ahead)).isoformat()
+                    db.execute(
+                        """INSERT INTO asset_maintenance
+                        (asset_id, task, due_at, status, created_at)
+                        VALUES (?, ?, ?, 'Scheduled', ?)""",
+                        (asset["id"], task, due, now_iso()),
+                    )
+                    db.execute(
+                        "UPDATE assets SET next_maintenance_at=?, updated_at=? WHERE id=?",
+                        (due, now_iso(), asset["id"]),
+                    )
+        db.execute(
+            """INSERT INTO asset_events
+            (asset_id, action, summary, actor_id, actor_name, metadata_json, created_at)
+            SELECT m.asset_id, 'Maintenance scheduled',
+                m.task || ' · due ' || m.due_at, m.created_by,
+                'PulseDesk Migration', '{}', m.created_at
+            FROM asset_maintenance m
+            WHERE NOT EXISTS (
+                SELECT 1 FROM asset_events e
+                WHERE e.asset_id=m.asset_id AND e.action='Maintenance scheduled'
+                AND e.summary=m.task || ' · due ' || m.due_at
+            )"""
+        )
         # Backfill historical demo/legacy resolved rows without replacing any ticket data.
         db.execute(
             "UPDATE tickets SET resolved_at = updated_at WHERE status = 'Resolved' AND resolved_at IS NULL"
@@ -1246,10 +1440,16 @@ def dashboard():
     recent = db.execute("SELECT * FROM tickets ORDER BY created_at DESC LIMIT 6").fetchall()
     activity = db.execute("SELECT * FROM activity ORDER BY id DESC LIMIT 6").fetchall()
     assets = db.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+    asset_metrics = asset_lifecycle_metrics(db)
+    asset_attention = (
+        asset_metrics["warranty_expiring"] + asset_metrics["warranty_expired"]
+        + asset_metrics["maintenance_due"]
+    )
     return render_template(
         "dashboard.html", active_page="overview", total=len(tickets), open_count=open_count,
         breached=len(breached), critical=critical, resolved=resolved, active=active,
         priorities=priorities, recent=recent, activity=activity, asset_count=assets,
+        asset_metrics=asset_metrics, asset_attention=asset_attention,
         sla_health=round(100 * (len(tickets) - len(breached)) / max(1, len(tickets))),
     )
 
@@ -1437,33 +1637,330 @@ def assets_page():
     db = get_db()
     if request.method == "POST":
         tag = request.form.get("asset_tag", "").strip().upper()[:30]
-        name = request.form.get("name", "").strip()
+        name = request.form.get("name", "").strip()[:100]
         asset_type = request.form.get("asset_type", "Laptop").strip()[:40]
         assigned = request.form.get("assigned_to", "Unassigned").strip()[:100] or "Unassigned"
         department = request.form.get("department", "Operations").strip()[:60] or "Operations"
         status = request.form.get("status", "In stock")
         warranty = request.form.get("warranty_until", "").strip()
-        if not tag or not name or status not in ASSET_STATUSES:
-            flash("Enter an asset tag and name, and choose a valid status.", "error")
-        else:
-            try:
-                db.execute(
-                    "INSERT INTO assets (asset_tag, name, asset_type, assigned_to, department, status, warranty_until) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (tag, name[:100], asset_type, assigned, department, status, warranty),
-                )
-                log_activity(db, "Asset registered", f"{tag} ? {name[:80]}", g.user["full_name"])
-                db.commit()
-                flash(f"Asset {tag} added to the inventory.", "success")
-            except sqlite3.IntegrityError:
-                flash(f"Asset tag {tag} already exists.", "error")
-        return redirect(url_for("assets_page"))
+        serial = request.form.get("serial_number", "").strip()[:100]
+        vendor = request.form.get("vendor", "").strip()[:100]
+        purchase_date = request.form.get("purchase_date", "").strip()
+        location = request.form.get("location", "").strip()[:120]
+        next_maintenance = request.form.get("next_maintenance_at", "").strip()
+        notes = request.form.get("notes", "").strip()[:2000]
+        try:
+            purchase_cost = float(request.form.get("purchase_cost", "").strip()) if request.form.get("purchase_cost", "").strip() else None
+            interval = int(request.form.get("maintenance_interval_days", "180"))
+            for label, value in (("Warranty end", warranty), ("Purchase date", purchase_date), ("Next maintenance", next_maintenance)):
+                if value:
+                    datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            flash("Enter valid dates, a numeric purchase cost and a whole-number maintenance interval.", "error")
+            return redirect(url_for("assets_page"))
+        if not tag or not name or status not in ASSET_STATUSES or purchase_cost is not None and purchase_cost < 0 or not 1 <= interval <= 3650:
+            flash("Check the required asset details, purchase cost and maintenance interval (1–3,650 days).", "error")
+            return redirect(url_for("assets_page"))
+        try:
+            cursor = db.execute(
+                """INSERT INTO assets
+                (asset_tag, name, asset_type, assigned_to, department, status, warranty_until,
+                 serial_number, vendor, purchase_date, purchase_cost, location, notes,
+                 next_maintenance_at, maintenance_interval_days, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (tag, name, asset_type, assigned, department, status, warranty, serial, vendor,
+                 purchase_date, purchase_cost, location, notes, next_maintenance, interval, now_iso()),
+            )
+            asset_id = cursor.lastrowid
+            write_asset_event(
+                db, asset_id, "Asset registered", f"{tag} · {name} added to the inventory.",
+                g.user["id"], g.user["full_name"],
+                {"asset_tag": tag, "type": asset_type, "assigned_to": assigned, "status": status},
+            )
+            log_activity(db, "Asset registered", f"{tag} · {name[:80]}", g.user["full_name"])
+            db.commit()
+            flash(f"Asset {tag} added to the inventory.", "success")
+            return redirect(url_for("asset_detail", asset_id=asset_id))
+        except sqlite3.IntegrityError:
+            db.rollback()
+            flash(f"Asset tag {tag} already exists.", "error")
+            return redirect(url_for("assets_page"))
+
     q = request.args.get("q", "").strip()[:100]
-    assets = db.execute(
-        "SELECT * FROM assets WHERE asset_tag LIKE ? OR name LIKE ? OR assigned_to LIKE ? ORDER BY id DESC",
-        (f"%{q}%", f"%{q}%", f"%{q}%"),
+    watch = request.args.get("watch", "")
+    clauses = []
+    params = []
+    if q:
+        clauses.append("(a.asset_tag LIKE ? OR a.name LIKE ? OR a.assigned_to LIKE ? OR a.serial_number LIKE ? OR a.vendor LIKE ?)")
+        params.extend([f"%{q}%"] * 5)
+    today = datetime.now().date().isoformat()
+    horizon = (datetime.now().date() + timedelta(days=60)).isoformat()
+    if watch == "warranty":
+        clauses.append("a.status != 'Retired' AND a.warranty_until != '' AND a.warranty_until <= ?")
+        params.append(horizon)
+    elif watch == "maintenance":
+        clauses.append("a.status != 'Retired' AND a.next_maintenance_at != '' AND a.next_maintenance_at <= ?")
+        params.append(horizon)
+    elif watch == "unassigned":
+        clauses.append("a.assigned_to='Unassigned' AND a.status != 'Retired'")
+    elif watch == "repair":
+        clauses.append("a.status='In repair'")
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    rows = db.execute(
+        f"""SELECT a.* FROM assets a{where}
+        ORDER BY CASE WHEN a.status='Retired' THEN 1 ELSE 0 END,
+        CASE WHEN a.next_maintenance_at != '' AND a.next_maintenance_at <= ? THEN 0 ELSE 1 END,
+        a.id DESC""",
+        (*params, today),
     ).fetchall()
-    counts = {s: db.execute("SELECT COUNT(*) FROM assets WHERE status = ?", (s,)).fetchone()[0] for s in ASSET_STATUSES}
-    return render_template("assets.html", active_page="assets", assets=assets, counts=counts, q=q)
+    assets = [decorate_asset(row) for row in rows]
+    counts = {state: db.execute("SELECT COUNT(*) FROM assets WHERE status=?", (state,)).fetchone()[0] for state in ASSET_STATUSES}
+    metrics = asset_lifecycle_metrics(db)
+    attention = db.execute(
+        """SELECT a.id, a.asset_tag, a.name, a.warranty_until, a.next_maintenance_at,
+        CASE WHEN a.next_maintenance_at != '' AND a.next_maintenance_at <= ?
+             THEN 'Maintenance due'
+             WHEN a.warranty_until != '' AND a.warranty_until < ?
+             THEN 'Warranty expired'
+             ELSE 'Warranty expiring' END AS reason
+        FROM assets a
+        WHERE a.status != 'Retired' AND (
+            (a.next_maintenance_at != '' AND a.next_maintenance_at <= ?)
+            OR (a.warranty_until != '' AND a.warranty_until <= ?)
+        )
+        ORDER BY CASE WHEN a.next_maintenance_at != '' AND a.next_maintenance_at <= ? THEN 0 ELSE 1 END,
+        COALESCE(NULLIF(a.next_maintenance_at,''), a.warranty_until) ASC LIMIT 6""",
+        (today, today, today, horizon, today),
+    ).fetchall()
+    return render_template(
+        "assets.html", active_page="assets", assets=assets, counts=counts,
+        metrics=metrics, attention=attention, q=q, watch=watch,
+    )
+
+
+@app.route("/export/assets.csv")
+@roles_required("Admin", "IT Agent")
+def export_assets():
+    db = get_db()
+    rows = db.execute(
+        """SELECT a.id, a.asset_tag, a.name, a.asset_type, a.serial_number, a.vendor,
+        a.assigned_to, a.department, a.location, a.status, a.purchase_date, a.purchase_cost,
+        a.warranty_until, a.next_maintenance_at, a.maintenance_interval_days, a.updated_at,
+        (SELECT COUNT(*) FROM asset_events e WHERE e.asset_id=a.id) AS event_count
+        FROM assets a ORDER BY a.asset_tag"""
+    ).fetchall()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Asset ID", "Asset tag", "Name", "Type", "Serial number", "Vendor",
+        "Assigned to", "Department", "Location", "Status", "Purchase date",
+        "Purchase cost (EUR)", "Warranty end", "Next maintenance",
+        "Maintenance interval (days)", "Updated at", "Lifecycle events",
+    ])
+    for row in rows:
+        writer.writerow(tuple(row))
+    write_audit_event(
+        db, "report", "asset-inventory", "Asset inventory exported",
+        f"Asset lifecycle register exported with {len(rows)} device(s).",
+        g.user["id"], g.user["full_name"], {"asset_count": len(rows)},
+    )
+    db.commit()
+    response = make_response("\ufeff" + output.getvalue())
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = f"attachment; filename=pulsedesk-assets-{datetime.now():%Y-%m-%d}.csv"
+    return response
+
+
+@app.route("/api/assets/lifecycle")
+@roles_required("Admin", "IT Agent")
+def asset_lifecycle_api():
+    db = get_db()
+    metrics = asset_lifecycle_metrics(db)
+    return jsonify({
+        "checked_at": now_iso(),
+        "metrics": metrics,
+        "attention_count": (
+            metrics["warranty_expiring"] + metrics["warranty_expired"]
+            + metrics["maintenance_due"]
+        ),
+    })
+
+
+@app.route("/assets/<int:asset_id>", methods=["GET", "POST"])
+@roles_required("Admin", "IT Agent")
+def asset_detail(asset_id: int):
+    db = get_db()
+    asset = db.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+    if asset is None:
+        abort(404)
+    if request.method == "POST":
+        status = request.form.get("status", asset["status"])
+        assigned = request.form.get("assigned_to", asset["assigned_to"]).strip()[:100] or "Unassigned"
+        department = request.form.get("department", asset["department"]).strip()[:60] or "Operations"
+        name = request.form.get("name", asset["name"]).strip()[:100]
+        asset_type = request.form.get("asset_type", asset["asset_type"]).strip()[:40]
+        serial = request.form.get("serial_number", "").strip()[:100]
+        vendor = request.form.get("vendor", "").strip()[:100]
+        purchase_date = request.form.get("purchase_date", "").strip()
+        warranty = request.form.get("warranty_until", "").strip()
+        location = request.form.get("location", "").strip()[:120]
+        notes = request.form.get("notes", "").strip()[:2000]
+        next_maintenance = request.form.get("next_maintenance_at", "").strip()
+        try:
+            cost_text = request.form.get("purchase_cost", "").strip()
+            purchase_cost = float(cost_text) if cost_text else None
+            interval = int(request.form.get("maintenance_interval_days", "180"))
+            for label, value in (("Purchase date", purchase_date), ("Warranty end", warranty), ("Next maintenance", next_maintenance)):
+                if value:
+                    datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            flash("Enter valid dates, a numeric purchase cost and a whole-number maintenance interval.", "error")
+            return redirect(url_for("asset_detail", asset_id=asset_id))
+        if not name or status not in ASSET_STATUSES or purchase_cost is not None and purchase_cost < 0 or not 1 <= interval <= 3650:
+            flash("Check the asset details, purchase cost and maintenance interval.", "error")
+            return redirect(url_for("asset_detail", asset_id=asset_id))
+        new_values = {
+            "name": name, "asset_type": asset_type, "assigned_to": assigned,
+            "department": department, "status": status, "serial_number": serial,
+            "vendor": vendor, "purchase_date": purchase_date, "purchase_cost": purchase_cost,
+            "warranty_until": warranty, "location": location, "notes": notes,
+            "next_maintenance_at": next_maintenance, "maintenance_interval_days": interval,
+        }
+        changes = {
+            field: {"from": asset[field], "to": value}
+            for field, value in new_values.items()
+            if asset[field] != value
+        }
+        db.execute(
+            """UPDATE assets SET name=?, asset_type=?, assigned_to=?, department=?, status=?,
+            serial_number=?, vendor=?, purchase_date=?, purchase_cost=?, warranty_until=?,
+            location=?, notes=?, next_maintenance_at=?, maintenance_interval_days=?, updated_at=?
+            WHERE id=?""",
+            (name, asset_type, assigned, department, status, serial, vendor, purchase_date,
+             purchase_cost, warranty, location, notes, next_maintenance, interval, now_iso(), asset_id),
+        )
+        if changes:
+            fragments = []
+            for field, value in changes.items():
+                label = field.replace("_", " ")
+                fragments.append(f"{label}: {value['from'] or '—'} → {value['to'] or '—'}")
+            summary = "; ".join(fragments)
+            write_asset_event(
+                db, asset_id, "Asset details updated", summary,
+                g.user["id"], g.user["full_name"], changes,
+            )
+            log_activity(db, "Asset updated", f"{asset['asset_tag']} · {summary[:140]}", g.user["full_name"])
+        db.commit()
+        flash("Asset details saved.", "success")
+        return redirect(url_for("asset_detail", asset_id=asset_id))
+
+    asset = decorate_asset(asset)
+    events = db.execute(
+        "SELECT * FROM asset_events WHERE asset_id=? ORDER BY id DESC LIMIT 30", (asset_id,)
+    ).fetchall()
+    maintenance = db.execute(
+        """SELECT m.*, u.full_name AS completed_by_name
+        FROM asset_maintenance m LEFT JOIN users u ON u.id=m.completed_by
+        WHERE m.asset_id=?
+        ORDER BY CASE m.status WHEN 'Scheduled' THEN 0 WHEN 'Completed' THEN 1 ELSE 2 END,
+        CASE WHEN m.status='Scheduled' THEN m.due_at END ASC, m.id DESC LIMIT 30""",
+        (asset_id,),
+    ).fetchall()
+    return render_template(
+        "asset_detail.html", active_page="assets", asset=asset,
+        events=events, maintenance=maintenance,
+    )
+
+
+@app.post("/assets/<int:asset_id>/maintenance")
+@roles_required("Admin", "IT Agent")
+def schedule_asset_maintenance(asset_id: int):
+    db = get_db()
+    asset = db.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+    if asset is None:
+        abort(404)
+    if asset["status"] == "Retired":
+        flash("Retired assets cannot receive new maintenance schedules.", "error")
+        return redirect(url_for("asset_detail", asset_id=asset_id))
+    task = request.form.get("task", "").strip()[:180]
+    due_at = request.form.get("due_at", "").strip()
+    try:
+        due_date = datetime.fromisoformat(due_at).date()
+    except (TypeError, ValueError):
+        flash("Choose a valid maintenance due date.", "error")
+        return redirect(url_for("asset_detail", asset_id=asset_id))
+    if not task or due_date < datetime.now().date():
+        flash("Add a task and choose today or a future date.", "error")
+        return redirect(url_for("asset_detail", asset_id=asset_id))
+    cursor = db.execute(
+        """INSERT INTO asset_maintenance
+        (asset_id, task, due_at, status, created_by, created_at)
+        VALUES (?, ?, ?, 'Scheduled', ?, ?)""",
+        (asset_id, task, due_date.isoformat(), g.user["id"], now_iso()),
+    )
+    next_due = db.execute(
+        "SELECT MIN(due_at) FROM asset_maintenance WHERE asset_id=? AND status='Scheduled'",
+        (asset_id,),
+    ).fetchone()[0]
+    db.execute(
+        "UPDATE assets SET next_maintenance_at=?, updated_at=? WHERE id=?",
+        (next_due or "", now_iso(), asset_id),
+    )
+    write_asset_event(
+        db, asset_id, "Maintenance scheduled",
+        f"{task} · due {due_date.isoformat()}",
+        g.user["id"], g.user["full_name"],
+        {"maintenance_id": cursor.lastrowid, "task": task, "due_at": due_date.isoformat()},
+    )
+    log_activity(db, "Asset maintenance scheduled", f"{asset['asset_tag']} · {task[:100]}", g.user["full_name"])
+    db.commit()
+    flash("Maintenance scheduled and added to the asset timeline.", "success")
+    return redirect(url_for("asset_detail", asset_id=asset_id))
+
+
+@app.post("/assets/<int:asset_id>/maintenance/<int:maintenance_id>/complete")
+@roles_required("Admin", "IT Agent")
+def complete_asset_maintenance(asset_id: int, maintenance_id: int):
+    db = get_db()
+    asset = db.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+    maintenance = db.execute(
+        "SELECT * FROM asset_maintenance WHERE id=? AND asset_id=?",
+        (maintenance_id, asset_id),
+    ).fetchone()
+    if asset is None or maintenance is None:
+        abort(404)
+    if maintenance["status"] != "Scheduled":
+        flash("Only scheduled maintenance can be completed.", "error")
+        return redirect(url_for("asset_detail", asset_id=asset_id))
+    outcome = request.form.get("outcome", "").strip()[:500]
+    if not outcome:
+        flash("Add a short maintenance outcome before completing the task.", "error")
+        return redirect(url_for("asset_detail", asset_id=asset_id))
+    completed_at = now_iso()
+    db.execute(
+        """UPDATE asset_maintenance SET status='Completed', outcome=?,
+        completed_by=?, completed_at=? WHERE id=? AND status='Scheduled'""",
+        (outcome, g.user["id"], completed_at, maintenance_id),
+    )
+    next_due = db.execute(
+        "SELECT MIN(due_at) FROM asset_maintenance WHERE asset_id=? AND status='Scheduled'",
+        (asset_id,),
+    ).fetchone()[0]
+    db.execute(
+        "UPDATE assets SET next_maintenance_at=?, updated_at=? WHERE id=?",
+        (next_due or "", completed_at, asset_id),
+    )
+    write_asset_event(
+        db, asset_id, "Maintenance completed",
+        f"{maintenance['task']} · {outcome}",
+        g.user["id"], g.user["full_name"],
+        {"maintenance_id": maintenance_id, "task": maintenance["task"],
+         "due_at": maintenance["due_at"], "outcome": outcome},
+    )
+    log_activity(db, "Asset maintenance completed", f"{asset['asset_tag']} · {maintenance['task'][:100]}", g.user["full_name"])
+    db.commit()
+    flash("Maintenance marked complete. The next scheduled date has been recalculated.", "success")
+    return redirect(url_for("asset_detail", asset_id=asset_id))
 
 
 @app.route("/knowledge")

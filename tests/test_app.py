@@ -403,6 +403,233 @@ class PulseDeskTests(unittest.TestCase):
         with sqlite3.connect(self.db_path) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM ticket_escalations").fetchone()[0], 0)
 
+    def test_asset_register_saves_procurement_fields_and_initial_timeline_event(self):
+        response = self.post("/assets", {
+            "asset_tag": "AST-999", "name": "Test laptop", "asset_type": "Laptop",
+            "assigned_to": "Taylor Reed", "department": "Engineering",
+            "status": "In use", "warranty_until": "2028-01-01",
+            "serial_number": "SN-TEST-999", "vendor": "Example Devices",
+            "purchase_date": "2026-10-01", "purchase_cost": "1499.95",
+            "location": "Floor 2 · Desk 14", "maintenance_interval_days": "180",
+            "next_maintenance_at": "2027-01-01", "notes": "Demo lifecycle record.",
+        }, follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"AST-999", response.data)
+        self.assertIn(b"Asset timeline", response.data)
+        with sqlite3.connect(self.db_path) as db:
+            row = db.execute(
+                """SELECT name, assigned_to, serial_number, vendor, purchase_date,
+                purchase_cost, location, warranty_until, next_maintenance_at, notes
+                FROM assets WHERE asset_tag='AST-999'"""
+            ).fetchone()
+            event = db.execute(
+                "SELECT action, actor_name FROM asset_events WHERE asset_id=(SELECT id FROM assets WHERE asset_tag='AST-999') ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            audit = db.execute(
+                "SELECT action FROM audit_events WHERE entity_type='asset' AND entity_id=(SELECT CAST(id AS TEXT) FROM assets WHERE asset_tag='AST-999') ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(row, (
+            "Test laptop", "Taylor Reed", "SN-TEST-999", "Example Devices",
+            "2026-10-01", 1499.95, "Floor 2 · Desk 14", "2028-01-01",
+            "2027-01-01", "Demo lifecycle record.",
+        ))
+        self.assertEqual(event, ("Asset registered", "Alex Morgan"))
+        self.assertEqual(audit[0], "Asset registered")
+
+    def test_asset_profile_changes_are_audited_and_render_in_timeline(self):
+        response = self.post("/assets/1", {
+            "name": "MacBook Pro 14 - Reassigned",
+            "asset_type": "Laptop", "assigned_to": "Taylor Reed",
+            "department": "Engineering", "status": "In repair",
+            "serial_number": "MBP-001", "vendor": "Apple",
+            "purchase_date": "2025-08-12", "purchase_cost": "1899.00",
+            "warranty_until": "2027-08-12", "location": "IT Workshop",
+            "next_maintenance_at": "2026-12-01",
+            "maintenance_interval_days": "120",
+            "notes": "Battery diagnostics required.",
+        }, follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Asset details updated", response.data)
+        self.assertIn(b"Taylor Reed", response.data)
+        with sqlite3.connect(self.db_path) as db:
+            row = db.execute(
+                "SELECT assigned_to, department, status, location, purchase_cost FROM assets WHERE id=1"
+            ).fetchone()
+            event = db.execute(
+                "SELECT action, summary FROM asset_events WHERE asset_id=1 ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(row, ("Taylor Reed", "Engineering", "In repair", "IT Workshop", 1899.0))
+        self.assertEqual(event[0], "Asset details updated")
+        self.assertIn("assigned to", event[1])
+        self.assertIn("status", event[1])
+
+    def test_asset_maintenance_schedule_completion_and_next_due_recalculation(self):
+        self.post("/assets", {
+            "asset_tag": "AST-MAINT", "name": "Maintenance test device",
+            "asset_type": "Laptop", "assigned_to": "Unassigned",
+            "department": "Engineering", "status": "In stock",
+        })
+        with sqlite3.connect(self.db_path) as db:
+            asset_id = db.execute("SELECT id FROM assets WHERE asset_tag='AST-MAINT'").fetchone()[0]
+        first_due = (datetime.now().date() + timedelta(days=10)).isoformat()
+        second_due = (datetime.now().date() + timedelta(days=20)).isoformat()
+        self.post(f"/assets/{asset_id}/maintenance", {
+            "task": "Annual endpoint health check", "due_at": first_due,
+        }, follow_redirects=True)
+        self.post(f"/assets/{asset_id}/maintenance", {
+            "task": "Battery capacity review", "due_at": second_due,
+        }, follow_redirects=True)
+        with sqlite3.connect(self.db_path) as db:
+            tasks = db.execute(
+                "SELECT id, due_at FROM asset_maintenance WHERE asset_id=? AND status='Scheduled' ORDER BY due_at",
+                (asset_id,),
+            ).fetchall()
+            next_due = db.execute("SELECT next_maintenance_at FROM assets WHERE id=?", (asset_id,)).fetchone()[0]
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual(next_due, first_due)
+
+        maintenance_id = tasks[0][0]
+        response = self.post(
+            f"/assets/{asset_id}/maintenance/{maintenance_id}/complete",
+            {"outcome": "Firmware updated; endpoint checks passed."},
+            follow_redirects=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Maintenance completed", response.data)
+        with sqlite3.connect(self.db_path) as db:
+            completed = db.execute(
+                "SELECT status, outcome FROM asset_maintenance WHERE id=?",
+                (maintenance_id,),
+            ).fetchone()
+            next_due_after = db.execute(
+                "SELECT next_maintenance_at FROM assets WHERE id=?", (asset_id,)
+            ).fetchone()[0]
+            events = db.execute(
+                "SELECT action FROM asset_events WHERE asset_id=? ORDER BY id DESC LIMIT 3",
+                (asset_id,),
+            ).fetchall()
+        self.assertEqual(completed, ("Completed", "Firmware updated; endpoint checks passed."))
+        self.assertEqual(next_due_after, second_due)
+        self.assertEqual(events[0][0], "Maintenance completed")
+        self.assertEqual(events[1][0], "Maintenance scheduled")
+
+        repeated = self.post(
+            f"/assets/{asset_id}/maintenance/{maintenance_id}/complete",
+            {"outcome": "Duplicate completion attempt."},
+            follow_redirects=True,
+        )
+        self.assertEqual(repeated.status_code, 200)
+        with sqlite3.connect(self.db_path) as db:
+            event_count = db.execute(
+                "SELECT COUNT(*) FROM asset_events WHERE asset_id=? AND action='Maintenance completed'",
+                (asset_id,),
+            ).fetchone()[0]
+        self.assertEqual(event_count, 1)
+
+    def test_asset_lifecycle_metrics_and_watch_filters_reflect_attention(self):
+        today = datetime.now().date()
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("UPDATE assets SET warranty_until=''")
+            db.execute(
+                "UPDATE assets SET warranty_until=? WHERE id=1",
+                ((today + timedelta(days=15)).isoformat(),),
+            )
+            db.execute(
+                "UPDATE assets SET warranty_until=? WHERE id=2",
+                ((today - timedelta(days=5)).isoformat(),),
+            )
+            db.execute(
+                "UPDATE assets SET next_maintenance_at=? WHERE id=3",
+                ((today - timedelta(days=1)).isoformat(),),
+            )
+            db.commit()
+        warranty = self.client.get("/assets?watch=warranty")
+        self.assertEqual(warranty.status_code, 200)
+        self.assertIn(b"AST-001", warranty.data)
+        self.assertIn(b"AST-002", warranty.data)
+        warranty_table = warranty.data.split(b'<table class="data-table asset-lifecycle-table">', 1)[1].split(b"</table>", 1)[0]
+        self.assertNotIn(b"AST-003", warranty_table)
+        maintenance = self.client.get("/assets?watch=maintenance")
+        self.assertEqual(maintenance.status_code, 200)
+        self.assertIn(b"AST-003", maintenance.data)
+        metrics = self.client.get("/api/assets/lifecycle")
+        self.assertEqual(metrics.status_code, 200)
+        payload = metrics.get_json()
+        self.assertEqual(payload["metrics"]["warranty_expiring"], 1)
+        self.assertEqual(payload["metrics"]["warranty_expired"], 1)
+        self.assertEqual(payload["metrics"]["maintenance_due"], 1)
+        self.assertEqual(payload["attention_count"], 3)
+
+    def test_asset_export_contains_lifecycle_fields_and_is_audited(self):
+        response = self.client.get("/export/assets.csv")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text/csv", response.content_type)
+        contents = response.get_data(as_text=True)
+        self.assertIn("Serial number", contents)
+        self.assertIn("Purchase cost (EUR)", contents)
+        self.assertIn("Maintenance interval (days)", contents)
+        self.assertIn("AST-001", contents)
+        with sqlite3.connect(self.db_path) as db:
+            event = db.execute(
+                "SELECT action FROM audit_events WHERE entity_type='report' AND entity_id='asset-inventory' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(event[0], "Asset inventory exported")
+
+    def test_asset_lifecycle_access_is_restricted_from_employees(self):
+        employee = self.login_client("employee@pulsedesk.demo", "EmployeeDemo!2026")
+        self.assertEqual(employee.get("/assets").status_code, 403)
+        self.assertEqual(employee.get("/assets/1").status_code, 403)
+        self.assertEqual(employee.get("/api/assets/lifecycle").status_code, 403)
+        self.assertEqual(employee.get("/export/assets.csv").status_code, 403)
+        with employee.session_transaction() as session:
+            csrf = session["_csrf_token"]
+        self.assertEqual(employee.post("/assets/1/maintenance", data={
+            "task": "Unauthorised", "due_at": "2027-01-01", "csrf_token": csrf,
+        }).status_code, 403)
+
+    def test_existing_assets_receive_one_baseline_history_entry_without_duplicate_migration(self):
+        with sqlite3.connect(self.db_path) as db:
+            asset_count = db.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+            event_count = db.execute(
+                "SELECT COUNT(DISTINCT asset_id) FROM asset_events"
+            ).fetchone()[0]
+            first_event_count = db.execute(
+                "SELECT COUNT(*) FROM asset_events WHERE action='Inventory baseline'"
+            ).fetchone()[0]
+        self.assertEqual(event_count, asset_count)
+        self.assertEqual(first_event_count, asset_count)
+        init_db()
+        with sqlite3.connect(self.db_path) as db:
+            repeated_count = db.execute(
+                "SELECT COUNT(*) FROM asset_events WHERE action='Inventory baseline'"
+            ).fetchone()[0]
+        self.assertEqual(repeated_count, asset_count)
+
+    def test_asset_event_timeline_is_append_only(self):
+        with app.app_context():
+            db = app_module.get_db()
+            app_module.write_asset_event(
+                db, 1, "Test lifecycle event", "Do not rewrite this history.",
+                1, "Alex Morgan", {"source": "unit-test"},
+            )
+            db.commit()
+        with sqlite3.connect(self.db_path) as db:
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute(
+                    "UPDATE asset_events SET summary='rewritten' WHERE summary='Do not rewrite this history.'"
+                )
+            db.rollback()
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute(
+                    "DELETE FROM asset_events WHERE summary='Do not rewrite this history.'"
+                )
+            db.rollback()
+            row = db.execute(
+                "SELECT action, actor_name, metadata_json FROM asset_events WHERE summary='Do not rewrite this history.'"
+            ).fetchone()
+        self.assertEqual(row[0:2], ("Test lifecycle event", "Alex Morgan"))
+        self.assertIn("unit-test", row[2])
+
     def test_asset_can_be_registered(self):
         response = self.post("/assets", {
             "asset_tag": "AST-999", "name": "Test laptop", "asset_type": "Laptop",

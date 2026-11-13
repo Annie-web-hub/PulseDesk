@@ -25,7 +25,7 @@
 <a class="nav-link {% if active_page == 'overview' %}active{% endif %}" href="{{ url_for('dashboard') }}"><span class="nav-icon">⌗</span> Command overview</a>
 <a class="nav-link {% if active_page == 'assistant' %}active{% endif %}" href="{{ url_for('smart_assistant') }}"><span class="nav-icon">✳</span> Pulse Assist <span class="nav-ai-tag">BETA</span></a>
 <a class="nav-link {% if active_page == 'tickets' %}active{% endif %}" href="{{ url_for('tickets_page') }}"><span class="nav-icon">◫</span> Incident queue <span class="nav-count">{{ open_count_global }}</span></a>
-<a class="nav-link {% if active_page == 'assets' %}active{% endif %}" href="{{ url_for('assets_page') }}"><span class="nav-icon">▣</span> Asset register</a>
+<a class="nav-link {% if active_page == 'assets' %}active{% endif %}" href="{{ url_for('assets_page') }}"><span class="nav-icon">▣</span> Asset lifecycle</a>
 <a class="nav-link {% if active_page == 'knowledge' %}active{% endif %}" href="{{ url_for('knowledge_page') }}"><span class="nav-icon">▤</span> Runbooks</a>
 <a class="nav-link {% if active_page == 'reports' %}active{% endif %}" href="{{ url_for('reports_page') }}"><span class="nav-icon">◒</span> Intelligence</a>
 </nav>

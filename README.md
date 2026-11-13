@@ -12,6 +12,10 @@ PulseDesk is a portfolio project demonstrating how an IT team can manage inciden
 
 ![PulseDesk 7.0 monitoring & integrations](docs/pulsedesk-monitoring-preview.png)
 
+![PulseDesk 8.0 asset lifecycle](docs/pulsedesk-assets-preview.png)
+
+![PulseDesk 8.0 asset record and maintenance history](docs/pulsedesk-asset-detail-preview.png)
+
 [View the new sign-in design](docs/pulsedesk-login-preview.png)
 
 ## Product capabilities
@@ -24,6 +28,11 @@ PulseDesk is a portfolio project demonstrating how an IT team can manage inciden
 - **Rule-based smart triage:** suggest priority and response targets from incident keywords and category.
 - **SLA monitoring:** identify overdue incidents and surface an SLA watchlist.
 - **Asset inventory:** register devices, track assignment, department, repair state and warranty.
+- **Asset lifecycle:** maintain serial number, vendor, purchase date/cost, physical location, notes and a configurable maintenance interval.
+- **Warranty watchlist:** surface expired and soon-to-expire warranties in the asset register, with quick filters and dashboard attention counts.
+- **Maintenance planner:** schedule asset work, record completion outcomes and automatically recalculate the next scheduled maintenance date.
+- **Asset chain of custody:** append-only event timeline for registration, record changes, assignments and maintenance activity, mirrored into the global audit log.
+- **Asset register export:** download lifecycle metadata and event counts as a UTF-8 CSV.
 - **Knowledge base:** searchable IT help articles and troubleshooting guides.
 - **Analytics & reporting:** explore live incident intake/resolution trends, priority mix, current backlog, SLA compliance and team workload/performance.
 - **Reporting windows:** filter trends to 7-day or 30-day daily buckets, 90-day weekly buckets, or a 12-month monthly view.
@@ -99,6 +108,16 @@ The assignment scorer considers only active Admin/IT Agent accounts. Its transpa
 
 Audit events are append-only at the application/database level: SQLite triggers reject UPDATE and DELETE. Events include the actor, timestamp, entity, summary and structured metadata. This is not tamper-proof against someone with direct database-file/DDL access; production audit events should also be forwarded to protected central or tamper-evident storage.
 
+## Asset lifecycle
+
+Every asset now has procurement and lifecycle fields for serial number, vendor, purchase date, purchase cost in EUR, location, notes, warranty end, maintenance interval and next scheduled maintenance. Existing inventory rows are migrated in place; asset IDs, tags and existing ownership/status values are retained.
+
+The asset register highlights warranties expiring within 60 days, expired warranties, maintenance due today or earlier, maintenance scheduled within 60 days, and unassigned devices. Filters open the matching watchlists. The dashboard's quick-deploy tile includes the current number of devices needing attention.
+
+Open an asset to edit its profile, schedule maintenance, record work performed and inspect its timeline. Completing a maintenance task stores the outcome and recalculates the device's next maintenance date from its remaining scheduled tasks. A scheduled task cannot be completed twice. The asset timeline is append-only via SQLite triggers and its events are also mirrored into the global audit log.
+
+The first lifecycle migration creates one baseline history event for each pre-existing device. Demo records also include a few upcoming maintenance tasks to make the planner explorable after setup. Maintenance and warranty dates currently surface in the register; automatic email reminders, vendor integrations, depreciation schedules and file attachments are not included yet.
+
 ## Useful endpoints
 
 All operational routes below require an Admin or IT Agent session unless noted otherwise. State-changing POST routes require CSRF validation.
@@ -116,6 +135,12 @@ All operational routes below require an Admin or IT Agent session unless noted o
 | POST /monitoring/test-email | Admin-only SMTP test to the signed-in account |
 | /api/monitoring/health | Protected JSON health snapshot |
 | `worker.py` | Separate scheduled SLA worker process |
+| /assets | Asset lifecycle register and watchlists |
+| `/assets/{id}` | Asset profile, maintenance planner and event timeline |
+| `POST /assets/{id}/maintenance` | Schedule maintenance |
+| `POST /assets/{id}/maintenance/{maintenance_id}/complete` | Record completed maintenance |
+| `/api/assets/lifecycle` | Protected asset attention metrics |
+| `/export/assets.csv` | Export lifecycle asset register |
 | /audit-log | Search the append-only event history |
 | `/api/tickets/{id}/assignment-suggestions` | Ranked active IT account suggestions |
 | /export/daily-operations.csv | Download a live daily operations brief |
@@ -226,7 +251,9 @@ pulsedesk/
 │   ├── workflow.html       # SLA policies, escalation runner and audit preview
 │   ├── audit_log.html      # Searchable immutable event history
 │   ├── monitoring.html     # Worker health, calendar and SMTP outbox
-│   └── ...                 # Other Jinja screens and reusable layout
+│   ├── assets.html          # Asset lifecycle inventory and watchlists
+│   ├── asset_detail.html    # Device profile, maintenance and event timeline
+│   └── ...                  # Other Jinja screens and reusable layout
 ├── worker.py               # Opt-in scheduled SLA worker process
 ├── tests/
 │   └── test_app.py         # Authentication and workflow integration tests
@@ -235,6 +262,8 @@ pulsedesk/
 │   ├── pulsedesk-analytics-preview.png
 │   ├── pulsedesk-workflow-preview.png
 │   ├── pulsedesk-monitoring-preview.png
+│   ├── pulsedesk-assets-preview.png
+│   ├── pulsedesk-asset-detail-preview.png
 │   └── pulsedesk-login-preview.png
 ├── .gitignore
 ├── requirements.txt
@@ -243,7 +272,7 @@ pulsedesk/
 
 ## Engineering and security notes
 
-- Existing PulseDesk databases receive additive schema migrations for ticket ownership, escalation history, resolution timestamps, workflow rules, audit events, the operating calendar and worker state; existing ticket and asset rows are retained.
+- Existing PulseDesk databases receive additive schema migrations for ticket ownership, escalation history, resolution timestamps, workflow rules, audit events, the operating calendar, worker state and asset lifecycle metadata; existing ticket and asset rows are retained.
 - SQL statements use parameter binding for user-supplied values.
 - Passwords are hashed with Werkzeug's password hashing helpers; plaintext passwords are never stored.
 - Session cookies are HTTP-only and use SameSite=Lax. Set `PULSEDESK_SECURE_COOKIES=1` behind HTTPS to enable the Secure cookie flag. CSRF tokens are checked for POST requests.
@@ -253,7 +282,7 @@ pulsedesk/
 - Knowledge matches, recurring themes and assignment rankings are heuristic decision-support signals, not semantic root-cause analysis or autonomous decisions.
 - The scheduled worker is opt-in and separate from Flask; it performs no scheduled ticket changes until an Admin enables the scheduler and starts `worker.py`.
 - Business-calendar timestamps use local wall-clock time, so the configured timezone should match the host machine's timezone. Public holidays and exception dates are not yet modelled.
-- Audit events are append-only through database triggers, but direct access to the SQLite file is not tamper-proof storage.
+- Audit events and asset timeline events are append-only through database triggers, but direct access to the SQLite file is not tamper-proof storage.
 - Email alerts are sent only when SMTP host and sender settings are present; otherwise the outbox records a preview rather than claiming delivery.
 - The live dashboard uses authenticated eight-second HTTP polling, not a persistent WebSocket connection.
 
@@ -261,9 +290,9 @@ This is a local portfolio demonstration, not a production-ready identity or serv
 
 ## Next iterations
 
-1. Add holiday/exception calendars, on-call rotations and production process supervision.
-2. Add reassignment history, richer user lifecycle controls and protected central audit forwarding.
-3. Add CI, deployment configuration and browser-based end-to-end tests.
+1. Add asset warranty reminder delivery, vendor/contract records, depreciation and attachments.
+2. Add holiday/exception calendars, on-call rotations and production process supervision.
+3. Add reassignment history, richer user lifecycle controls, CI and browser-based end-to-end tests.
 
 ## Licence
 
