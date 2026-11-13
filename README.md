@@ -10,6 +10,8 @@ PulseDesk is a portfolio project demonstrating how an IT team can manage inciden
 
 ![PulseDesk 6.0 workflow engine](docs/pulsedesk-workflow-preview.png)
 
+![PulseDesk 7.0 monitoring & integrations](docs/pulsedesk-monitoring-preview.png)
+
 [View the new sign-in design](docs/pulsedesk-login-preview.png)
 
 ## Product capabilities
@@ -42,6 +44,10 @@ PulseDesk is a portfolio project demonstrating how an IT team can manage inciden
 - **SLA workflow engine:** configure three-stage escalation delays per priority and manually process the next eligible stage for overdue incidents.
 - **Immutable audit log:** append structured ticket, assignment, escalation, workflow-policy and report-export events; SQLite triggers reject updates and deletes.
 - **Daily operations export:** generate a live CSV snapshot with daily intake/resolution, current risk counts, recurring themes and the active incident register.
+- **Real-time worker health:** run the separate SLA worker with a single-instance lease, heartbeat, error reporting and configurable check interval.
+- **Business-hours SLA clock:** calculate escalation delays using configurable local timezone, working days and daily operating hours; nights and weekends do not accumulate escalation minutes.
+- **Monitoring & integrations:** view database health, scheduler status, worker heartbeat, SMTP configuration and delivery-outbox history from one protected screen.
+- **SMTP test delivery:** Admins can send a test to their own signed-in address when SMTP is configured; otherwise a labelled preview is stored without sending.
 
 ## Analytics definitions
 
@@ -73,9 +79,21 @@ PulseDesk seeds 12 editable SLA rules: one for each priority at each of three es
 | Medium | 240 min | 480 min | 1,440 min |
 | Low | 1,440 min | 2,880 min | 4,320 min |
 
-An Admin can edit the delay or pause any rule. Admins and IT Agents can explicitly run the SLA check. The runner skips tickets whose due time is in the future, applies only the next eligible stage per ticket on each run, records the escalation in the incident history, and sends normal in-app/email-outbox notifications. Re-running the check does not repeat an already-recorded stage.
+An Admin can edit the delay or pause any rule. Admins and IT Agents can explicitly run a manual SLA check. The runner skips tickets whose due time is in the future, applies only the next eligible stage per ticket on each run, records the escalation in the incident history, and sends normal in-app/email-outbox notifications.
 
-**This is a manual runner, not a background scheduler.** It does not guarantee real-time escalation. A production service needs a managed scheduler/worker, a business-hours and holiday calendar, timezone rules, on-call routing, retry/idempotency controls and operational monitoring.
+### Scheduled worker and operating calendar
+
+PulseDesk 7.0 adds `worker.py`, a separate process from the Flask web server. Scheduling is **disabled by default**. An Admin must configure the operating calendar and explicitly enable scheduled checks on **Monitoring**, then start the worker in a second PowerShell window from the project directory:
+
+```powershell
+py worker.py
+```
+
+The worker sends a heartbeat every 10 seconds, acquires a 35-second database lease to prevent duplicate instances, and checks the queue at the configured interval (30, 60, 120, 300 or 600 seconds). When the scheduler is paused, the worker remains online but makes no ticket changes. Stop it with Ctrl+C. A one-time worker cycle can be tested with `py worker.py --once`; it exits after a single pass.
+
+The default calendar is **Europe/Riga, Monday–Friday, 09:00–17:00**. The post-deadline escalation clock counts business minutes only, excluding nights and unselected days. A threshold of zero means the first working minute after the SLA deadline; no escalation is triggered while zero working minutes have elapsed. The configured timezone should match the host machine's local timezone because existing ticket timestamps are stored as local wall-clock times. The calendar is weekly; public holidays and custom exception dates are not yet modelled.
+
+The worker is opt-in and does not start automatically with Flask. If the worker is stopped or the computer sleeps, scheduled checks stop; the Monitoring screen shows a stale heartbeat as offline. A local development process is not a production service supervisor. A production deployment should run the worker under Task Scheduler, a Windows service or an equivalent process manager, with alerting on heartbeat expiry, timezone-aware business calendars, holiday schedules, on-call routing, backups and retry/idempotency monitoring.
 
 The assignment scorer considers only active Admin/IT Agent accounts. Its transparent workload score is active × 3 + critical × 5 + overdue × 3; the lowest score is recommended first. It does not modify a ticket until a teammate confirms the selected assignee.
 
@@ -92,7 +110,12 @@ All operational routes below require an Admin or IT Agent session unless noted o
 | /api/assistant/summary | Today's operational summary |
 | /api/assistant/recurrences?days=90 | Keyword-theme recurrence scan |
 | /workflow | SLA workflow policy and manual runner |
-| POST /workflow/run-sla | Check overdue incidents and apply next eligible stages |
+| POST /workflow/run-sla | Manually check overdue incidents and apply next eligible stages |
+| /monitoring | Worker health, SMTP delivery and business calendar |
+| POST /monitoring/calendar | Admin-only calendar and scheduler settings |
+| POST /monitoring/test-email | Admin-only SMTP test to the signed-in account |
+| /api/monitoring/health | Protected JSON health snapshot |
+| `worker.py` | Separate scheduled SLA worker process |
 | /audit-log | Search the append-only event history |
 | `/api/tickets/{id}/assignment-suggestions` | Ranked active IT account suggestions |
 | /export/daily-operations.csv | Download a live daily operations brief |
@@ -124,7 +147,9 @@ These credentials are intentionally predictable for a portfolio demonstration. *
 | Use Pulse Assist and view daily IT brief | ✓ | ✓ | — |
 | View assignment suggestions and confirm assignments | ✓ | ✓ | — |
 | View workflow rules and run SLA check | ✓ | ✓ | — |
-| Configure SLA workflow rules | ✓ | — | — |
+| Configure SLA workflow rules and business calendar | ✓ | — | — |
+| Enable scheduled checks and test SMTP | ✓ | — | — |
+| View worker health and SMTP outbox | ✓ | ✓ | — |
 | View audit log and export daily brief | ✓ | ✓ | — |
 
 ## Escalation levels
@@ -149,11 +174,18 @@ py -m venv .venv
 # 2. Install dependencies
 py -m pip install -r requirements.txt
 
-# 3. Start PulseDesk
+# 3. Start PulseDesk in the first PowerShell window
 py app.py
 ```
 
-Open **http://127.0.0.1:5000** and sign in with one of the demo accounts above.
+Open **http://127.0.0.1:5000** and sign in with the Admin account. Visit **Monitoring** to review the default Europe/Riga business calendar. Scheduling is off by default; enable it only when ready to let the worker process overdue tickets.
+
+```powershell
+# 4. In a second PowerShell window, from the same project directory:
+py worker.py
+```
+
+The worker can remain open with scheduled checks paused, providing a heartbeat for the Monitoring screen. To enable actual automatic escalation, first enable the scheduler in the Admin-only Monitoring settings. Stop the worker with Ctrl+C. Use `py worker.py --once` for a one-cycle check.
 
 ### Configure real email delivery (optional)
 
@@ -193,13 +225,16 @@ pulsedesk/
 │   ├── assistant.html      # Pulse Assist, daily brief and pattern radar
 │   ├── workflow.html       # SLA policies, escalation runner and audit preview
 │   ├── audit_log.html      # Searchable immutable event history
+│   ├── monitoring.html     # Worker health, calendar and SMTP outbox
 │   └── ...                 # Other Jinja screens and reusable layout
+├── worker.py               # Opt-in scheduled SLA worker process
 ├── tests/
 │   └── test_app.py         # Authentication and workflow integration tests
 ├── docs/
 │   ├── pulsedesk-dashboard-preview.png
 │   ├── pulsedesk-analytics-preview.png
 │   ├── pulsedesk-workflow-preview.png
+│   ├── pulsedesk-monitoring-preview.png
 │   └── pulsedesk-login-preview.png
 ├── .gitignore
 ├── requirements.txt
@@ -208,7 +243,7 @@ pulsedesk/
 
 ## Engineering and security notes
 
-- Existing PulseDesk databases receive additive schema migrations for ticket ownership, escalation history, resolution timestamps, workflow rules and audit events; existing ticket and asset rows are retained.
+- Existing PulseDesk databases receive additive schema migrations for ticket ownership, escalation history, resolution timestamps, workflow rules, audit events, the operating calendar and worker state; existing ticket and asset rows are retained.
 - SQL statements use parameter binding for user-supplied values.
 - Passwords are hashed with Werkzeug's password hashing helpers; plaintext passwords are never stored.
 - Session cookies are HTTP-only and use SameSite=Lax. Set `PULSEDESK_SECURE_COOKIES=1` behind HTTPS to enable the Secure cookie flag. CSRF tokens are checked for POST requests.
@@ -216,7 +251,8 @@ pulsedesk/
 - Demo records use fictional names. Do not enter real employee or incident information into this demo.
 - Smart triage and Pulse Assist use transparent keyword/category rules, not a trained AI model; all recommendations require human review.
 - Knowledge matches, recurring themes and assignment rankings are heuristic decision-support signals, not semantic root-cause analysis or autonomous decisions.
-- SLA escalation only runs when an authorised Admin/IT Agent submits the workflow action; no background scheduler is included in this demo.
+- The scheduled worker is opt-in and separate from Flask; it performs no scheduled ticket changes until an Admin enables the scheduler and starts `worker.py`.
+- Business-calendar timestamps use local wall-clock time, so the configured timezone should match the host machine's timezone. Public holidays and exception dates are not yet modelled.
 - Audit events are append-only through database triggers, but direct access to the SQLite file is not tamper-proof storage.
 - Email alerts are sent only when SMTP host and sender settings are present; otherwise the outbox records a preview rather than claiming delivery.
 - The live dashboard uses authenticated eight-second HTTP polling, not a persistent WebSocket connection.
@@ -225,7 +261,7 @@ This is a local portfolio demonstration, not a production-ready identity or serv
 
 ## Next iterations
 
-1. Add a managed background runner with timezone-aware operating hours, holidays and on-call schedules.
+1. Add holiday/exception calendars, on-call rotations and production process supervision.
 2. Add reassignment history, richer user lifecycle controls and protected central audit forwarding.
 3. Add CI, deployment configuration and browser-based end-to-end tests.
 

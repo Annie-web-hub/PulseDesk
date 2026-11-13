@@ -12,8 +12,10 @@ from email.message import EmailMessage
 from functools import wraps
 from html import escape
 from urllib.parse import urlparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from pathlib import Path
+from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -604,17 +606,99 @@ def suggest_ticket_assignees(
     return suggestions
 
 
+def get_sla_calendar(db: sqlite3.Connection) -> dict:
+    row = db.execute("SELECT * FROM sla_calendar WHERE id = 1").fetchone()
+    if row is None:
+        return {
+            "timezone_name": "Europe/Riga", "business_start": "09:00",
+            "business_end": "17:00", "weekdays": "0,1,2,3,4",
+            "scheduler_enabled": 0, "interval_seconds": 60,
+        }
+    result = dict(row)
+    result["weekday_numbers"] = {
+        int(value) for value in result["weekdays"].split(",") if value.strip().isdigit()
+    }
+    return result
+
+
+def calendar_now(calendar: dict) -> datetime:
+    return datetime.now(ZoneInfo(calendar["timezone_name"])).replace(tzinfo=None, microsecond=0)
+
+
+def business_minutes_between(
+    start: datetime, end: datetime, calendar: dict
+) -> int:
+    """Count working minutes in the configured weekly calendar, excluding weekends/off-hours."""
+    if end <= start:
+        return 0
+    weekdays = calendar.get("weekday_numbers")
+    if weekdays is None:
+        weekdays = {
+            int(value) for value in calendar.get("weekdays", "0,1,2,3,4").split(",")
+            if value.strip().isdigit()
+        }
+    day_start = time.fromisoformat(calendar.get("business_start", "09:00"))
+    day_end = time.fromisoformat(calendar.get("business_end", "17:00"))
+    if day_start >= day_end:
+        return 0
+    total_seconds = 0
+    days = (end.date() - start.date()).days
+    for offset in range(days + 1):
+        current_date = start.date() + timedelta(days=offset)
+        if current_date.weekday() not in weekdays:
+            continue
+        window_start = datetime.combine(current_date, day_start)
+        window_end = datetime.combine(current_date, day_end)
+        overlap_start = max(start, window_start)
+        overlap_end = min(end, window_end)
+        if overlap_end > overlap_start:
+            total_seconds += (overlap_end - overlap_start).total_seconds()
+    return int(total_seconds // 60)
+
+
+def worker_status_snapshot(db: sqlite3.Connection) -> dict:
+    state = db.execute("SELECT * FROM worker_state WHERE id = 1").fetchone()
+    calendar = get_sla_calendar(db)
+    if state is None:
+        return {"online": False, "status": "offline", "heartbeat_age_seconds": None}
+    heartbeat_age = None
+    if state["last_heartbeat"]:
+        try:
+            heartbeat_age = max(
+                0, int((datetime.now() - datetime.fromisoformat(state["last_heartbeat"])).total_seconds())
+            )
+        except ValueError:
+            heartbeat_age = None
+    online = (
+        heartbeat_age is not None and heartbeat_age <= 35
+        and state["status"] in ("starting", "running", "paused", "error")
+    )
+    result = dict(state)
+    result["online"] = online
+    result["status"] = state["status"] if online else "offline"
+    result["heartbeat_age_seconds"] = heartbeat_age
+    result["scheduler_enabled"] = bool(calendar["scheduler_enabled"])
+    return result
+
+
 def run_sla_escalation_check(
-    db: sqlite3.Connection, actor_id: int, actor_name: str
+    db: sqlite3.Connection, actor_id: int | None, actor_name: str
 ) -> dict:
-    """Process only the next configured escalation stage for each eligible ticket."""
+    """Process only the next configured escalation stage for each eligible ticket.
+
+    Acquire a write reservation before reading the queue so manual and scheduled checks
+    cannot both apply the same escalation stage at the same time.
+    """
+    if not db.in_transaction:
+        db.execute("BEGIN IMMEDIATE")
     rules = db.execute(
         "SELECT * FROM workflow_rules WHERE is_active = 1 ORDER BY overdue_minutes, escalation_level"
     ).fetchall()
     tickets = db.execute(
         "SELECT * FROM tickets WHERE status != 'Resolved' ORDER BY due_at ASC"
     ).fetchall()
-    current = datetime.now()
+    calendar = get_sla_calendar(db)
+    current = calendar_now(calendar)
     escalated = []
     skipped = 0
     for ticket in tickets:
@@ -625,7 +709,9 @@ def run_sla_escalation_check(
             continue
         if due_at >= current:
             continue
-        overdue_minutes = int((current - due_at).total_seconds() // 60)
+        overdue_minutes = business_minutes_between(due_at, current, calendar)
+        if overdue_minutes == 0:
+            continue
         next_level = int(ticket["escalation_level"] or 0) + 1
         rule = next((
             item for item in rules
@@ -801,10 +887,35 @@ def init_db() -> None:
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS sla_calendar (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                timezone_name TEXT NOT NULL DEFAULT 'Europe/Riga',
+                business_start TEXT NOT NULL DEFAULT '09:00',
+                business_end TEXT NOT NULL DEFAULT '17:00',
+                weekdays TEXT NOT NULL DEFAULT '0,1,2,3,4',
+                scheduler_enabled INTEGER NOT NULL DEFAULT 0,
+                interval_seconds INTEGER NOT NULL DEFAULT 60,
+                updated_by INTEGER REFERENCES users(id),
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS worker_state (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                owner_token TEXT,
+                worker_name TEXT NOT NULL DEFAULT 'PulseDesk SLA Worker',
+                status TEXT NOT NULL DEFAULT 'offline',
+                started_at TEXT,
+                last_heartbeat TEXT,
+                last_run TEXT,
+                last_result TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                lease_until TEXT
+            );
             CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
             CREATE INDEX IF NOT EXISTS idx_tickets_priority ON tickets(priority);
             CREATE INDEX IF NOT EXISTS idx_tickets_due ON tickets(due_at);
             CREATE INDEX IF NOT EXISTS idx_escalations_ticket ON ticket_escalations(ticket_id, id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_escalations_ticket_level_unique
+            ON ticket_escalations(ticket_id, level);
             CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, id);
             CREATE INDEX IF NOT EXISTS idx_activity_id ON activity(id);
             CREATE INDEX IF NOT EXISTS idx_email_outbox_created ON email_outbox(created_at);
@@ -832,6 +943,17 @@ def init_db() -> None:
                     "INSERT INTO users (email, full_name, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
                     (email, full_name, generate_password_hash(password), role, now_iso()),
                 )
+        db.execute(
+            """INSERT OR IGNORE INTO sla_calendar
+            (id, timezone_name, business_start, business_end, weekdays, scheduler_enabled, interval_seconds, updated_at)
+            VALUES (1, 'Europe/Riga', '09:00', '17:00', '0,1,2,3,4', 0, 60, ?)""",
+            (now_iso(),),
+        )
+        db.execute(
+            """INSERT OR IGNORE INTO worker_state
+            (id, worker_name, status, last_result, last_error)
+            VALUES (1, 'PulseDesk SLA Worker', 'offline', '', '')"""
+        )
         if db.execute("SELECT COUNT(*) FROM workflow_rules").fetchone()[0] == 0:
             db.executemany(
                 """INSERT INTO workflow_rules
@@ -1708,6 +1830,148 @@ def assistant_recurrences_api():
     days = min(365, max(7, days))
     tickets = get_db().execute("SELECT * FROM tickets ORDER BY created_at DESC").fetchall()
     return jsonify({"days": days, "patterns": detect_recurring_incidents(tickets, days)})
+
+
+@app.route("/monitoring")
+@roles_required("Admin", "IT Agent")
+def monitoring_page():
+    db = get_db()
+    calendar = get_sla_calendar(db)
+    worker = worker_status_snapshot(db)
+    worker_last_summary = ""
+    if worker.get("last_result"):
+        try:
+            last_result = json.loads(worker["last_result"])
+            worker_last_summary = (
+                f"{last_result.get('checked', 0)} incidents checked · "
+                f"{last_result.get('escalated_count', 0)} new escalation(s)"
+            )
+        except (TypeError, ValueError):
+            worker_last_summary = "Previous worker result is not available in summary format."
+    outbox = db.execute(
+        """SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
+            SUM(CASE WHEN status='preview' THEN 1 ELSE 0 END) AS preview,
+            SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed
+        FROM email_outbox"""
+    ).fetchone()
+    recent_mail = db.execute(
+        "SELECT id, recipient, subject, status, error, created_at FROM email_outbox ORDER BY id DESC LIMIT 8"
+    ).fetchall()
+    return render_template(
+        "monitoring.html", active_page="monitoring", calendar=calendar, worker=worker,
+        outbox=dict(outbox), recent_mail=recent_mail, smtp_configured=smtp_is_configured(),
+        worker_last_summary=worker_last_summary,
+    )
+
+
+@app.post("/monitoring/calendar")
+@roles_required("Admin")
+def save_monitoring_calendar():
+    db = get_db()
+    timezone_name = request.form.get("timezone_name", "Europe/Riga").strip()[:80]
+    start_value = request.form.get("business_start", "09:00")
+    end_value = request.form.get("business_end", "17:00")
+    weekdays = sorted({int(value) for value in request.form.getlist("weekdays") if value.isdigit() and 0 <= int(value) <= 6})
+    enabled = 1 if request.form.get("scheduler_enabled") == "1" else 0
+    try:
+        ZoneInfo(timezone_name)
+        start = time.fromisoformat(start_value)
+        end = time.fromisoformat(end_value)
+        interval = int(request.form.get("interval_seconds", "60"))
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        flash("Enter a valid timezone, working hours and worker interval.", "error")
+        return redirect(url_for("monitoring_page"))
+    if start >= end or not weekdays or interval not in (30, 60, 120, 300, 600):
+        flash("Choose working hours with an end after the start, at least one working day and a supported check interval.", "error")
+        return redirect(url_for("monitoring_page"))
+
+    db.execute(
+        """UPDATE sla_calendar
+        SET timezone_name=?, business_start=?, business_end=?, weekdays=?,
+            scheduler_enabled=?, interval_seconds=?, updated_by=?, updated_at=?
+        WHERE id=1""",
+        (timezone_name, start.strftime("%H:%M"), end.strftime("%H:%M"),
+         ",".join(str(day) for day in weekdays), enabled, interval,
+         g.user["id"], now_iso()),
+    )
+    write_audit_event(
+        db, "sla_calendar", "1", "Monitoring settings updated",
+        f"Business calendar set to {timezone_name}, {start:%H:%M}–{end:%H:%M}, weekdays {weekdays}; automatic checks {'enabled' if enabled else 'paused'}.",
+        g.user["id"], g.user["full_name"],
+        {"timezone": timezone_name, "business_start": start.strftime("%H:%M"),
+         "business_end": end.strftime("%H:%M"), "weekdays": weekdays,
+         "scheduler_enabled": bool(enabled), "interval_seconds": interval},
+    )
+    db.commit()
+    flash("Monitoring settings saved. The running worker will pick them up on its next heartbeat.", "success")
+    return redirect(url_for("monitoring_page"))
+
+
+@app.post("/monitoring/test-email")
+@roles_required("Admin")
+def send_monitoring_test_email():
+    db = get_db()
+    subject = "PulseDesk SMTP connectivity test"
+    body = (
+        f"Hello {g.user['full_name']},\n\n"
+        "This is a test message generated from the PulseDesk Monitoring & Integrations screen.\n"
+        f"Requested at: {now_iso()}\n"
+        f"SMTP configured: {'yes' if smtp_is_configured() else 'no'}\n\n"
+        "If SMTP is not configured, PulseDesk stores a preview in the local outbox instead of sending a message."
+    )
+    status = deliver_email(db, g.user["email"], subject, body)
+    write_audit_event(
+        db, "integration", "smtp", "SMTP test requested",
+        f"SMTP test for {g.user['email']} completed with status: {status}.",
+        g.user["id"], g.user["full_name"], {"status": status},
+    )
+    db.commit()
+    if status == "sent":
+        flash("Test email sent. Check your inbox.", "success")
+    elif status == "preview":
+        flash("SMTP is not configured. A clearly labelled preview was saved in the email outbox; no email was sent.", "error")
+    else:
+        flash("SMTP delivery failed. Review the error shown in the outbox.", "error")
+    return redirect(url_for("monitoring_page"))
+
+
+@app.route("/api/monitoring/health")
+@roles_required("Admin", "IT Agent")
+def monitoring_health_api():
+    db = get_db()
+    calendar = get_sla_calendar(db)
+    worker = worker_status_snapshot(db)
+    try:
+        db.execute("SELECT 1").fetchone()
+        quick_check = db.execute("PRAGMA quick_check").fetchone()
+        database_ok = bool(quick_check and quick_check[0] == "ok")
+    except sqlite3.DatabaseError:
+        database_ok = False
+    outbox = db.execute(
+        """SELECT COUNT(*) AS total,
+        SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
+        SUM(CASE WHEN status='preview' THEN 1 ELSE 0 END) AS preview,
+        SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed
+        FROM email_outbox"""
+    ).fetchone()
+    return jsonify({
+        "checked_at": now_iso(),
+        "database": {"status": "healthy" if database_ok else "error", "ok": database_ok},
+        "worker": {
+            "status": worker["status"], "online": worker["online"],
+            "heartbeat_age_seconds": worker["heartbeat_age_seconds"],
+            "last_heartbeat": worker["last_heartbeat"], "last_run": worker["last_run"],
+            "last_result": worker["last_result"], "last_error": worker["last_error"],
+        },
+        "scheduler": {
+            "enabled": bool(calendar["scheduler_enabled"]),
+            "interval_seconds": calendar["interval_seconds"],
+            "timezone": calendar["timezone_name"],
+        },
+        "smtp": {"configured": smtp_is_configured(), "outbox": dict(outbox)},
+    })
 
 
 @app.route("/workflow")

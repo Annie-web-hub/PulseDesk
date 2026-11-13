@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import app as app_module
+import worker as worker_module
 from app import app, init_db
 
 
@@ -576,6 +577,169 @@ class PulseDeskTests(unittest.TestCase):
         self.assertEqual(recurring.get_json()["days"], 365)
         self.assertIn("patterns", recurring.get_json())
 
+    def test_business_minute_clock_excludes_nights_and_weekends(self):
+        calendar = {
+            "timezone_name": "Europe/Riga",
+            "business_start": "09:00",
+            "business_end": "17:00",
+            "weekdays": "0,1,2,3,4",
+        }
+        friday = datetime(2026, 11, 13, 16, 0)
+        monday = datetime(2026, 11, 16, 10, 0)
+        self.assertEqual(app_module.business_minutes_between(friday, monday, calendar), 120)
+        outside_hours = datetime(2026, 11, 13, 17, 0)
+        weekend = datetime(2026, 11, 15, 12, 0)
+        self.assertEqual(app_module.business_minutes_between(outside_hours, weekend, calendar), 0)
+        same_day = app_module.business_minutes_between(
+            datetime(2026, 11, 16, 8, 0), datetime(2026, 11, 16, 18, 0), calendar
+        )
+        self.assertEqual(same_day, 480)
+
+    def test_monitoring_page_shows_worker_calendar_and_mail_status(self):
+        response = self.client.get("/monitoring")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Monitoring & integrations", response.data)
+        self.assertIn(b"Europe/Riga", response.data)
+        self.assertIn(b"py worker.py", response.data)
+        self.assertIn(b"Enable scheduled SLA checks", response.data)
+        self.assertIn(b"Preview mode", response.data)
+        health = self.client.get("/api/monitoring/health")
+        self.assertEqual(health.status_code, 200)
+        payload = health.get_json()
+        self.assertTrue(payload["database"]["ok"])
+        self.assertFalse(payload["scheduler"]["enabled"])
+        self.assertFalse(payload["worker"]["online"])
+        self.assertFalse(payload["smtp"]["configured"])
+
+    def test_admin_can_save_business_calendar_and_scheduler_setting(self):
+        response = self.post("/monitoring/calendar", {
+            "timezone_name": "Europe/Riga",
+            "business_start": "08:30",
+            "business_end": "16:30",
+            "weekdays": ["0", "1", "2", "3", "4", "5"],
+            "interval_seconds": "120",
+            "scheduler_enabled": "1",
+        }, follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Monitoring settings saved", response.data)
+        with sqlite3.connect(self.db_path) as db:
+            row = db.execute(
+                "SELECT timezone_name, business_start, business_end, weekdays, scheduler_enabled, interval_seconds FROM sla_calendar WHERE id=1"
+            ).fetchone()
+            audit = db.execute(
+                "SELECT action, summary FROM audit_events WHERE entity_type='sla_calendar' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(row, ("Europe/Riga", "08:30", "16:30", "0,1,2,3,4,5", 1, 120))
+        self.assertEqual(audit[0], "Monitoring settings updated")
+        self.assertIn("automatic checks enabled", audit[1])
+        health = self.client.get("/api/monitoring/health").get_json()
+        self.assertTrue(health["scheduler"]["enabled"])
+        self.assertEqual(health["scheduler"]["interval_seconds"], 120)
+
+    def test_invalid_monitoring_calendar_is_rejected_without_saving(self):
+        response = self.post("/monitoring/calendar", {
+            "timezone_name": "Mars/Olympus",
+            "business_start": "18:00",
+            "business_end": "09:00",
+            "weekdays": ["0"],
+            "interval_seconds": "15",
+            "scheduler_enabled": "1",
+        }, follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Enter a valid timezone", response.data)
+        with sqlite3.connect(self.db_path) as db:
+            row = db.execute(
+                "SELECT timezone_name, scheduler_enabled FROM sla_calendar WHERE id=1"
+            ).fetchone()
+        self.assertEqual(row, ("Europe/Riga", 0))
+
+    def test_monitoring_and_calendar_configuration_respect_roles(self):
+        agent = self.login_client("agent@pulsedesk.demo", "AgentDemo!2026")
+        self.assertEqual(agent.get("/monitoring").status_code, 200)
+        with agent.session_transaction() as session:
+            csrf = session["_csrf_token"]
+        self.assertEqual(agent.post("/monitoring/calendar", data={
+            "timezone_name": "Europe/Riga", "business_start": "09:00",
+            "business_end": "17:00", "weekdays": ["0", "1", "2", "3", "4"],
+            "interval_seconds": "60", "csrf_token": csrf,
+        }).status_code, 403)
+        employee = self.login_client("employee@pulsedesk.demo", "EmployeeDemo!2026")
+        self.assertEqual(employee.get("/monitoring").status_code, 403)
+        self.assertEqual(employee.get("/api/monitoring/health").status_code, 403)
+
+    def test_admin_smtp_test_creates_preview_when_smtp_is_missing(self):
+        with patch.object(app_module, "smtp_is_configured", return_value=False):
+            response = self.post("/monitoring/test-email", {}, follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"no email was sent", response.data)
+        with sqlite3.connect(self.db_path) as db:
+            row = db.execute(
+                "SELECT recipient, subject, status FROM email_outbox ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            audit = db.execute(
+                "SELECT action FROM audit_events WHERE entity_type='integration' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(row, ("admin@pulsedesk.demo", "PulseDesk SMTP connectivity test", "preview"))
+        self.assertEqual(audit[0], "SMTP test requested")
+
+    def test_worker_is_paused_by_default_and_rejects_a_second_instance(self):
+        claimed, result = worker_module.run_cycle("worker-test-one")
+        self.assertTrue(claimed)
+        self.assertEqual(result["status"], "paused")
+        duplicate, busy = worker_module.run_cycle("worker-test-two")
+        self.assertFalse(duplicate)
+        self.assertEqual(busy["status"], "busy")
+        with sqlite3.connect(self.db_path) as db:
+            state = db.execute(
+                "SELECT status, owner_token FROM worker_state WHERE id=1"
+            ).fetchone()
+        self.assertEqual(state, ("paused", "worker-test-one"))
+        worker_module.release_worker("worker-test-one")
+        with sqlite3.connect(self.db_path) as db:
+            state = db.execute(
+                "SELECT status, owner_token FROM worker_state WHERE id=1"
+            ).fetchone()
+        self.assertEqual(state, ("offline", None))
+
+    def test_worker_runs_scheduled_escalation_only_after_opt_in(self):
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("UPDATE tickets SET status='Resolved'")
+            db.execute("UPDATE workflow_rules SET is_active=0")
+            db.execute(
+                "UPDATE workflow_rules SET is_active=1 WHERE priority='High' AND escalation_level=1"
+            )
+            db.execute("UPDATE sla_calendar SET scheduler_enabled=1, interval_seconds=30 WHERE id=1")
+            db.execute(
+                """INSERT INTO tickets
+                (title, description, requester, department, category, priority, status, assignee,
+                 created_at, updated_at, due_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("Worker scheduled test", "Used to verify opt-in business-hours escalation.",
+                 "Test User", "Engineering", "Network", "High", "Open", "Unassigned",
+                 "2026-11-13T15:00:00", "2026-11-13T15:00:00", "2026-11-13T16:00:00"),
+            )
+            db.commit()
+            ticket_id = db.execute(
+                "SELECT id FROM tickets WHERE title='Worker scheduled test'"
+            ).fetchone()[0]
+        with patch.object(app_module, "calendar_now", return_value=datetime(2026, 11, 16, 10, 0)):
+            claimed, result = worker_module.run_cycle("worker-opt-in-test")
+        self.assertTrue(claimed)
+        self.assertEqual(result["status"], "running")
+        self.assertTrue(result["checked"])
+        self.assertEqual(result["result"]["escalated_count"], 1)
+        with sqlite3.connect(self.db_path) as db:
+            level = db.execute(
+                "SELECT escalation_level FROM tickets WHERE id=?", (ticket_id,)
+            ).fetchone()[0]
+            event = db.execute(
+                "SELECT actor_name, action FROM audit_events WHERE entity_id=? ORDER BY id DESC LIMIT 1",
+                (str(ticket_id),),
+            ).fetchone()
+        self.assertEqual(level, 1)
+        self.assertEqual(event, ("PulseDesk SLA Worker", "SLA escalation"))
+        worker_module.release_worker("worker-opt-in-test")
+
     def test_workflow_engine_page_renders_default_policy_matrix(self):
         response = self.client.get("/workflow")
         self.assertEqual(response.status_code, 200)
@@ -633,8 +797,8 @@ class PulseDeskTests(unittest.TestCase):
 
     def test_sla_workflow_escalates_one_configured_stage_per_manual_run(self):
         now = datetime.now().replace(microsecond=0)
-        created = (now - timedelta(hours=4)).isoformat(timespec="seconds")
-        due = (now - timedelta(hours=2)).isoformat(timespec="seconds")
+        created = (now - timedelta(hours=10)).isoformat(timespec="seconds")
+        due = (now - timedelta(hours=8)).isoformat(timespec="seconds")
         with sqlite3.connect(self.db_path) as db:
             cursor = db.execute(
                 """INSERT INTO tickets

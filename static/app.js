@@ -1,4 +1,18 @@
 document.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll("[data-copy-text]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const value = button.dataset.copyText || "";
+      try {
+        await navigator.clipboard.writeText(value);
+        const original = button.textContent;
+        button.textContent = "COPIED";
+        window.setTimeout(() => { button.textContent = original; }, 1400);
+      } catch (_error) {
+        button.textContent = "COPY FAILED";
+        window.setTimeout(() => { button.textContent = "COPY"; }, 1400);
+      }
+    });
+  });
   const body = document.body;
   const analysisResults = document.getElementById("analysis-results");
   if (analysisResults) {
