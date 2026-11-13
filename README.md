@@ -8,6 +8,8 @@ PulseDesk is a portfolio project demonstrating how an IT team can manage inciden
 
 ![PulseDesk analytics suite](docs/pulsedesk-analytics-preview.png)
 
+![PulseDesk 6.0 workflow engine](docs/pulsedesk-workflow-preview.png)
+
 [View the new sign-in design](docs/pulsedesk-login-preview.png)
 
 ## Product capabilities
@@ -36,6 +38,10 @@ PulseDesk is a portfolio project demonstrating how an IT team can manage inciden
 - **Recurring incident radar:** group tickets from a rolling 90-day window into visible keyword themes and link back to the source incidents.
 - **Daily operations brief:** calculate today's created/resolved volume, current active/critical/overdue/unassigned workload, recurring themes and recent activity.
 - **Assistant API:** role-protected JSON endpoints for incident analysis, daily summary and recurring patterns.
+- **Smart assignment:** rank active Admin and IT Agent accounts using their weighted active, critical and overdue workload; a human confirms the final assignment.
+- **SLA workflow engine:** configure three-stage escalation delays per priority and manually process the next eligible stage for overdue incidents.
+- **Immutable audit log:** append structured ticket, assignment, escalation, workflow-policy and report-export events; SQLite triggers reject updates and deletes.
+- **Daily operations export:** generate a live CSV snapshot with daily intake/resolution, current risk counts, recurring themes and the active incident register.
 
 ## Analytics definitions
 
@@ -56,14 +62,41 @@ Pulse Assist is intentionally a transparent local rules engine, not a trained la
 - The daily operations brief uses the computer's local date/time and current ticket records. It is a snapshot at page load, not a scheduled email report.
 - Suggestions never update a ticket's priority or status automatically. An IT responder must validate impact, urgency and the recommended action.
 
-Useful endpoints (Admin and IT Agent roles only):
+## Workflow engine and audit trail
+
+PulseDesk seeds 12 editable SLA rules: one for each priority at each of three escalation levels. Delays are measured in minutes after the ticket's due time.
+
+| Priority | Level 1 · Service Lead | Level 2 · IT Manager | Level 3 · Incident Manager |
+|---|---:|---:|---:|
+| Critical | 0 min | 30 min | 90 min |
+| High | 30 min | 120 min | 360 min |
+| Medium | 240 min | 480 min | 1,440 min |
+| Low | 1,440 min | 2,880 min | 4,320 min |
+
+An Admin can edit the delay or pause any rule. Admins and IT Agents can explicitly run the SLA check. The runner skips tickets whose due time is in the future, applies only the next eligible stage per ticket on each run, records the escalation in the incident history, and sends normal in-app/email-outbox notifications. Re-running the check does not repeat an already-recorded stage.
+
+**This is a manual runner, not a background scheduler.** It does not guarantee real-time escalation. A production service needs a managed scheduler/worker, a business-hours and holiday calendar, timezone rules, on-call routing, retry/idempotency controls and operational monitoring.
+
+The assignment scorer considers only active Admin/IT Agent accounts. Its transparent workload score is active × 3 + critical × 5 + overdue × 3; the lowest score is recommended first. It does not modify a ticket until a teammate confirms the selected assignee.
+
+Audit events are append-only at the application/database level: SQLite triggers reject UPDATE and DELETE. Events include the actor, timestamp, entity, summary and structured metadata. This is not tamper-proof against someone with direct database-file/DDL access; production audit events should also be forwarded to protected central or tamper-evident storage.
+
+## Useful endpoints
+
+All operational routes below require an Admin or IT Agent session unless noted otherwise. State-changing POST routes require CSRF validation.
 
 | Endpoint | Purpose |
 |---|---|
-| `/assistant` | Smart IT Assistant workspace |
-| `POST /api/assistant/analyze` | Analyse a supplied incident JSON object (requires session and CSRF token) |
-| `/api/assistant/summary` | Today's operational summary |
-| `/api/assistant/recurrences?days=90` | Keyword-theme recurrence scan |
+| /assistant | Smart IT Assistant workspace |
+| POST /api/assistant/analyze | Analyse a supplied incident JSON object |
+| /api/assistant/summary | Today's operational summary |
+| /api/assistant/recurrences?days=90 | Keyword-theme recurrence scan |
+| /workflow | SLA workflow policy and manual runner |
+| POST /workflow/run-sla | Check overdue incidents and apply next eligible stages |
+| /audit-log | Search the append-only event history |
+| `/api/tickets/{id}/assignment-suggestions` | Ranked active IT account suggestions |
+| /export/daily-operations.csv | Download a live daily operations brief |
+| /api/analytics?days=30 | Windowed operational analytics |
 
 ## Demo accounts
 
@@ -89,6 +122,10 @@ These credentials are intentionally predictable for a portfolio demonstration. *
 | Search the knowledge base | ✓ | ✓ | ✓ |
 | Create user accounts | ✓ | — | — |
 | Use Pulse Assist and view daily IT brief | ✓ | ✓ | — |
+| View assignment suggestions and confirm assignments | ✓ | ✓ | — |
+| View workflow rules and run SLA check | ✓ | ✓ | — |
+| Configure SLA workflow rules | ✓ | — | — |
+| View audit log and export daily brief | ✓ | ✓ | — |
 
 ## Escalation levels
 
@@ -154,12 +191,15 @@ pulsedesk/
 │   └── style.css           # Responsive product UI
 ├── templates/
 │   ├── assistant.html      # Pulse Assist, daily brief and pattern radar
+│   ├── workflow.html       # SLA policies, escalation runner and audit preview
+│   ├── audit_log.html      # Searchable immutable event history
 │   └── ...                 # Other Jinja screens and reusable layout
 ├── tests/
 │   └── test_app.py         # Authentication and workflow integration tests
 ├── docs/
 │   ├── pulsedesk-dashboard-preview.png
 │   ├── pulsedesk-analytics-preview.png
+│   ├── pulsedesk-workflow-preview.png
 │   └── pulsedesk-login-preview.png
 ├── .gitignore
 ├── requirements.txt
@@ -168,14 +208,16 @@ pulsedesk/
 
 ## Engineering and security notes
 
-- Existing PulseDesk databases receive additive schema migrations for accounts, ticket ownership, escalation history and incident resolution timestamps; existing ticket and asset rows are retained.
+- Existing PulseDesk databases receive additive schema migrations for ticket ownership, escalation history, resolution timestamps, workflow rules and audit events; existing ticket and asset rows are retained.
 - SQL statements use parameter binding for user-supplied values.
 - Passwords are hashed with Werkzeug's password hashing helpers; plaintext passwords are never stored.
 - Session cookies are HTTP-only and use SameSite=Lax. Set `PULSEDESK_SECURE_COOKIES=1` behind HTTPS to enable the Secure cookie flag. CSRF tokens are checked for POST requests.
 - The knowledge article renderer escapes source text before emitting its controlled HTML subset.
 - Demo records use fictional names. Do not enter real employee or incident information into this demo.
 - Smart triage and Pulse Assist use transparent keyword/category rules, not a trained AI model; all recommendations require human review.
-- Knowledge matches and recurring themes are heuristic signals, not semantic root-cause analysis or duplicate detection.
+- Knowledge matches, recurring themes and assignment rankings are heuristic decision-support signals, not semantic root-cause analysis or autonomous decisions.
+- SLA escalation only runs when an authorised Admin/IT Agent submits the workflow action; no background scheduler is included in this demo.
+- Audit events are append-only through database triggers, but direct access to the SQLite file is not tamper-proof storage.
 - Email alerts are sent only when SMTP host and sender settings are present; otherwise the outbox records a preview rather than claiming delivery.
 - The live dashboard uses authenticated eight-second HTTP polling, not a persistent WebSocket connection.
 
@@ -183,8 +225,8 @@ This is a local portfolio demonstration, not a production-ready identity or serv
 
 ## Next iterations
 
-1. Add assignment notifications, SLA calendars and configurable escalation rules.
-2. Add an immutable audit event log and richer user lifecycle controls.
+1. Add a managed background runner with timezone-aware operating hours, holidays and on-call schedules.
+2. Add reassignment history, richer user lifecycle controls and protected central audit forwarding.
 3. Add CI, deployment configuration and browser-based end-to-end tests.
 
 ## Licence

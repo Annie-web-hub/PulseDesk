@@ -576,6 +576,218 @@ class PulseDeskTests(unittest.TestCase):
         self.assertEqual(recurring.get_json()["days"], 365)
         self.assertIn("patterns", recurring.get_json())
 
+    def test_workflow_engine_page_renders_default_policy_matrix(self):
+        response = self.client.get("/workflow")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Workflow engine", response.data)
+        self.assertIn(b"Run escalation check", response.data)
+        self.assertIn(b"Critical", response.data)
+        self.assertIn(b"4320", response.data)
+        with sqlite3.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM workflow_rules").fetchone()[0], 12)
+
+    def test_admin_can_edit_sla_rule_and_change_is_audited(self):
+        page = self.client.get("/workflow")
+        self.assertIn(b'name="priority" value="Critical"', page.data)
+        self.assertIn(b'name="escalation_level" value="1"', page.data)
+        response = self.post("/workflow/rules/save", {
+            "rule_id": "1", "priority": "Critical", "escalation_level": "1",
+            "overdue_minutes": "12", "is_active": "1",
+        }, follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        with sqlite3.connect(self.db_path) as db:
+            rule = db.execute(
+                "SELECT overdue_minutes, target_role, is_active FROM workflow_rules WHERE id=1"
+            ).fetchone()
+            event = db.execute(
+                "SELECT action, summary FROM audit_events WHERE entity_type='workflow_rule' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(rule, (12, "Service Lead", 1))
+        self.assertEqual(event[0], "Rule saved")
+        self.assertIn("12 minutes", event[1])
+
+    def test_it_agent_can_run_workflow_but_cannot_change_policy(self):
+        agent = self.login_client("agent@pulsedesk.demo", "AgentDemo!2026")
+        self.assertEqual(agent.get("/workflow").status_code, 200)
+        self.assertEqual(agent.get("/audit-log").status_code, 200)
+        with agent.session_transaction() as session:
+            csrf = session["_csrf_token"]
+        response = agent.post("/workflow/rules/save", data={
+            "rule_id": "1", "priority": "Critical", "escalation_level": "1",
+            "overdue_minutes": "99", "is_active": "1", "csrf_token": csrf,
+        })
+        self.assertEqual(response.status_code, 403)
+
+    def test_employee_cannot_edit_or_run_workflow_policies(self):
+        employee = self.login_client("employee@pulsedesk.demo", "EmployeeDemo!2026")
+        self.assertEqual(employee.get("/workflow").status_code, 403)
+        self.assertEqual(employee.get("/audit-log").status_code, 403)
+        self.assertEqual(employee.get("/export/daily-operations.csv").status_code, 403)
+        self.assertEqual(employee.post("/workflow/run-sla", data={
+            "csrf_token": self.csrf_for(employee, "/knowledge")
+        }).status_code, 403)
+        self.assertEqual(employee.post("/workflow/rules/save", data={
+            "priority": "Critical", "escalation_level": 1,
+            "overdue_minutes": 0, "csrf_token": self.csrf_for(employee, "/knowledge")
+        }).status_code, 403)
+
+    def test_sla_workflow_escalates_one_configured_stage_per_manual_run(self):
+        now = datetime.now().replace(microsecond=0)
+        created = (now - timedelta(hours=4)).isoformat(timespec="seconds")
+        due = (now - timedelta(hours=2)).isoformat(timespec="seconds")
+        with sqlite3.connect(self.db_path) as db:
+            cursor = db.execute(
+                """INSERT INTO tickets
+                (title, description, requester, department, category, priority, status, assignee,
+                 created_at, updated_at, due_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("Workflow critical test", "A critical service outage used for testing.", "Test User",
+                 "Engineering", "Network", "Critical", "Open", "Unassigned",
+                 created, created, due),
+            )
+            ticket_id = cursor.lastrowid
+            db.commit()
+
+        first = self.post("/workflow/run-sla", {}, follow_redirects=True)
+        self.assertEqual(first.status_code, 200)
+        with sqlite3.connect(self.db_path) as db:
+            level = db.execute("SELECT escalation_level FROM tickets WHERE id=?", (ticket_id,)).fetchone()[0]
+            rows = db.execute("SELECT level, target_role FROM ticket_escalations WHERE ticket_id=? ORDER BY level", (ticket_id,)).fetchall()
+        self.assertEqual(level, 1)
+        self.assertEqual(rows, [(1, "Service Lead")])
+
+        self.post("/workflow/run-sla", {}, follow_redirects=True)
+        with sqlite3.connect(self.db_path) as db:
+            level = db.execute("SELECT escalation_level FROM tickets WHERE id=?", (ticket_id,)).fetchone()[0]
+            rows = db.execute("SELECT level FROM ticket_escalations WHERE ticket_id=? ORDER BY level", (ticket_id,)).fetchall()
+        self.assertEqual(level, 2)
+        self.assertEqual(rows, [(1,), (2,)])
+
+        self.post("/workflow/run-sla", {}, follow_redirects=True)
+        with sqlite3.connect(self.db_path) as db:
+            level = db.execute("SELECT escalation_level FROM tickets WHERE id=?", (ticket_id,)).fetchone()[0]
+            rows = db.execute("SELECT level FROM ticket_escalations WHERE ticket_id=? ORDER BY level", (ticket_id,)).fetchall()
+            audit = db.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE entity_id=? AND action='SLA escalation'",
+                (str(ticket_id),),
+            ).fetchone()[0]
+        self.assertEqual(level, 3)
+        self.assertEqual(rows, [(1,), (2,), (3,)])
+        self.assertEqual(audit, 3)
+
+    def test_sla_workflow_does_not_escalate_before_the_due_time(self):
+        now = datetime.now().replace(microsecond=0)
+        created = now.isoformat(timespec="seconds")
+        due = (now + timedelta(hours=1)).isoformat(timespec="seconds")
+        with sqlite3.connect(self.db_path) as db:
+            cursor = db.execute(
+                """INSERT INTO tickets
+                (title, description, requester, department, category, priority, status, assignee,
+                 created_at, updated_at, due_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("Not yet overdue", "An upcoming critical response deadline.", "Test User",
+                 "Engineering", "Network", "Critical", "Open", "Unassigned",
+                 created, created, due),
+            )
+            ticket_id = cursor.lastrowid
+            db.commit()
+        result = self.post("/workflow/run-sla", {}, follow_redirects=True)
+        self.assertEqual(result.status_code, 200)
+        with sqlite3.connect(self.db_path) as db:
+            ticket = db.execute(
+                "SELECT escalation_level FROM tickets WHERE id=?", (ticket_id,)
+            ).fetchone()[0]
+            count = db.execute(
+                "SELECT COUNT(*) FROM ticket_escalations WHERE ticket_id=?", (ticket_id,)
+            ).fetchone()[0]
+        self.assertEqual(ticket, 0)
+        self.assertEqual(count, 0)
+
+    def test_assignment_suggestions_rank_real_active_it_accounts(self):
+        response = self.client.get("/api/tickets/3/assignment-suggestions")
+        self.assertEqual(response.status_code, 200)
+        suggestions = response.get_json()["suggestions"]
+        self.assertGreaterEqual(len(suggestions), 2)
+        self.assertEqual(suggestions[0]["name"], "Alex Morgan")
+        self.assertIn("Lowest weighted workload", suggestions[0]["reason"])
+        self.assertNotIn("Maya Patel", {item["name"] for item in suggestions})
+
+    def test_assignment_requires_explicit_valid_confirmation_and_records_audit(self):
+        suggestions = self.client.get("/api/tickets/3/assignment-suggestions")
+        self.assertEqual(suggestions.status_code, 200)
+        response = self.post("/tickets/3/assign", {"assignee": "Alex Morgan"}, follow_redirects=True)
+        self.assertEqual(response.status_code, 200)
+        with sqlite3.connect(self.db_path) as db:
+            assignee = db.execute("SELECT assignee FROM tickets WHERE id=3").fetchone()[0]
+            event = db.execute(
+                "SELECT action, summary FROM audit_events WHERE entity_id='3' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(assignee, "Alex Morgan")
+        self.assertEqual(event[0], "Assignee changed")
+        self.assertIn("Alex Morgan", event[1])
+
+        invalid = self.post("/tickets/3/assign", {"assignee": "Not an IT account"}, follow_redirects=True)
+        self.assertEqual(invalid.status_code, 200)
+        with sqlite3.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT assignee FROM tickets WHERE id=3").fetchone()[0], "Alex Morgan")
+
+    def test_employee_cannot_assign_incidents_or_read_assignment_suggestions(self):
+        employee = self.login_client("employee@pulsedesk.demo", "EmployeeDemo!2026")
+        self.assertEqual(employee.get("/api/tickets/1/assignment-suggestions").status_code, 403)
+        with employee.session_transaction() as session:
+            csrf = session["_csrf_token"]
+        response = employee.post("/tickets/1/assign", data={
+            "assignee": "Alex Morgan", "csrf_token": csrf,
+        })
+        self.assertEqual(response.status_code, 403)
+
+    def test_audit_events_are_append_only_in_the_database(self):
+        with app.app_context():
+            db = app_module.get_db()
+            app_module.write_audit_event(
+                db, "test", "immutable-1", "Test event", "Cannot rewrite this event.",
+                1, "Alex Morgan", {"origin": "unit-test"},
+            )
+            db.commit()
+        with sqlite3.connect(self.db_path) as db:
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("UPDATE audit_events SET summary='rewritten' WHERE entity_id='immutable-1'")
+            db.rollback()
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("DELETE FROM audit_events WHERE entity_id='immutable-1'")
+            db.rollback()
+            row = db.execute(
+                "SELECT summary, metadata_json FROM audit_events WHERE entity_id='immutable-1'"
+            ).fetchone()
+        self.assertEqual(row[0], "Cannot rewrite this event.")
+        self.assertIn("unit-test", row[1])
+
+    def test_audit_log_search_and_daily_report_export(self):
+        self.post("/tickets/1", {
+            "status": "Waiting", "priority": "High", "assignee": "Jordan Lee",
+        })
+        audit = self.client.get("/audit-log?q=Ticket")
+        self.assertEqual(audit.status_code, 200)
+        self.assertIn(b"Ticket updated", audit.data)
+        report = self.client.get("/export/daily-operations.csv")
+        self.assertEqual(report.status_code, 200)
+        self.assertIn("text/csv", report.content_type)
+        self.assertIn("pulsedesk-daily-operations-", report.headers["Content-Disposition"])
+        contents = report.get_data(as_text=True)
+        self.assertIn("PulseDesk daily operations brief", contents)
+        self.assertIn("Active queue", contents)
+        self.assertIn("Open incident register", contents)
+        with sqlite3.connect(self.db_path) as db:
+            self.assertGreaterEqual(
+                db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0], 2
+            )
+
+    def test_ticket_detail_shows_workload_assignment_and_audit_context(self):
+        response = self.client.get("/tickets/3")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Who has capacity?", response.data)
+        self.assertIn(b"Assign selected teammate", response.data)
+
     def test_analytics_page_renders_period_filter_charts_and_team_table(self):
         response = self.client.get("/reports?days=7")
         self.assertEqual(response.status_code, 200)

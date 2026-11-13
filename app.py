@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 import re
 import secrets
@@ -515,6 +516,179 @@ def build_daily_operations_summary(db: sqlite3.Connection) -> dict:
     }
 
 
+def write_audit_event(
+    db: sqlite3.Connection,
+    entity_type: str,
+    entity_id: int | str,
+    action: str,
+    summary: str,
+    actor_id: int | None,
+    actor_name: str,
+    metadata: dict | None = None,
+) -> None:
+    """Append a structured event; database triggers prevent update/delete."""
+    db.execute(
+        """INSERT INTO audit_events
+        (entity_type, entity_id, action, summary, actor_id, actor_name, metadata_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            entity_type[:40], str(entity_id)[:80], action[:60], summary[:1000],
+            actor_id, actor_name[:100], json.dumps(metadata or {}, ensure_ascii=False)[:4000], now_iso(),
+        ),
+    )
+
+
+def default_workflow_rules() -> list[tuple[str, int, int, str]]:
+    return [
+        ("Critical", 1, 0, ESCALATION_TARGETS[1]),
+        ("Critical", 2, 30, ESCALATION_TARGETS[2]),
+        ("Critical", 3, 90, ESCALATION_TARGETS[3]),
+        ("High", 1, 30, ESCALATION_TARGETS[1]),
+        ("High", 2, 120, ESCALATION_TARGETS[2]),
+        ("High", 3, 360, ESCALATION_TARGETS[3]),
+        ("Medium", 1, 240, ESCALATION_TARGETS[1]),
+        ("Medium", 2, 480, ESCALATION_TARGETS[2]),
+        ("Medium", 3, 1440, ESCALATION_TARGETS[3]),
+        ("Low", 1, 1440, ESCALATION_TARGETS[1]),
+        ("Low", 2, 2880, ESCALATION_TARGETS[2]),
+        ("Low", 3, 4320, ESCALATION_TARGETS[3]),
+    ]
+
+
+def suggest_ticket_assignees(
+    db: sqlite3.Connection, ticket: sqlite3.Row
+) -> list[dict]:
+    """Rank active Admin/IT Agent accounts by weighted live workload."""
+    candidates = db.execute(
+        "SELECT id, full_name, role FROM users WHERE active = 1 AND role IN ('Admin', 'IT Agent') ORDER BY full_name"
+    ).fetchall()
+    suggestions = []
+    for person in candidates:
+        workload = db.execute(
+            """SELECT
+                COUNT(*) AS active,
+                SUM(CASE WHEN priority = 'Critical' THEN 1 ELSE 0 END) AS critical,
+                SUM(CASE WHEN due_at < ? THEN 1 ELSE 0 END) AS overdue,
+                SUM(CASE WHEN category = ? THEN 1 ELSE 0 END) AS same_category
+            FROM tickets
+            WHERE status != 'Resolved' AND assignee = ? AND id != ?""",
+            (now_iso(), ticket["category"], person["full_name"], ticket["id"]),
+        ).fetchone()
+        active = int(workload["active"] or 0)
+        critical = int(workload["critical"] or 0)
+        overdue = int(workload["overdue"] or 0)
+        same_category = int(workload["same_category"] or 0)
+        score = active * 3 + critical * 5 + overdue * 3
+        suggestions.append({
+            "id": person["id"],
+            "name": person["full_name"],
+            "role": person["role"],
+            "active": active,
+            "critical": critical,
+            "overdue": overdue,
+            "same_category": same_category,
+            "score": score,
+        })
+    suggestions.sort(key=lambda item: (item["score"], item["active"], item["name"].lower()))
+    if suggestions:
+        best = suggestions[0]
+        best["reason"] = (
+            f"Lowest weighted workload: {best['active']} active, "
+            f"{best['critical']} critical and {best['overdue']} overdue."
+        )
+        for item in suggestions[1:]:
+            item["reason"] = (
+                f"{item['active']} active, {item['critical']} critical and "
+                f"{item['overdue']} overdue."
+            )
+    return suggestions
+
+
+def run_sla_escalation_check(
+    db: sqlite3.Connection, actor_id: int, actor_name: str
+) -> dict:
+    """Process only the next configured escalation stage for each eligible ticket."""
+    rules = db.execute(
+        "SELECT * FROM workflow_rules WHERE is_active = 1 ORDER BY overdue_minutes, escalation_level"
+    ).fetchall()
+    tickets = db.execute(
+        "SELECT * FROM tickets WHERE status != 'Resolved' ORDER BY due_at ASC"
+    ).fetchall()
+    current = datetime.now()
+    escalated = []
+    skipped = 0
+    for ticket in tickets:
+        try:
+            due_at = datetime.fromisoformat(ticket["due_at"])
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        if due_at >= current:
+            continue
+        overdue_minutes = int((current - due_at).total_seconds() // 60)
+        next_level = int(ticket["escalation_level"] or 0) + 1
+        rule = next((
+            item for item in rules
+            if item["priority"] == ticket["priority"]
+            and item["escalation_level"] == next_level
+            and overdue_minutes >= item["overdue_minutes"]
+        ), None)
+        if not rule:
+            continue
+
+        target = rule["target_role"]
+        reason = (
+            f"Automated SLA workflow rule #{rule['id']}: "
+            f"{overdue_minutes} minute(s) past the due time "
+            f"(threshold {rule['overdue_minutes']} minutes)."
+        )
+        db.execute(
+            """INSERT INTO ticket_escalations
+            (ticket_id, level, target_role, reason, actor_id, actor_name, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (ticket["id"], next_level, target, reason, actor_id, actor_name, now_iso()),
+        )
+        db.execute(
+            "UPDATE tickets SET escalation_level = ?, updated_at = ? WHERE id = ?",
+            (next_level, now_iso(), ticket["id"]),
+        )
+        log_activity(
+            db, "SLA workflow escalated",
+            f"#{ticket['id']} → Level {next_level} → {target}", actor_name,
+        )
+        write_audit_event(
+            db, "ticket", ticket["id"], "SLA escalation",
+            f"Incident #{ticket['id']} escalated to {target} by workflow rule #{rule['id']}.",
+            actor_id, actor_name,
+            {"rule_id": rule["id"], "priority": ticket["priority"],
+             "overdue_minutes": overdue_minutes, "level": next_level},
+        )
+        notify_roles(
+            db, ("Admin", "IT Agent"), "escalation",
+            f"Incident #{ticket['id']} escalated by SLA workflow",
+            f"PulseDesk advanced {ticket['title']} to {target}. {reason}",
+            f"/tickets/{ticket['id']}", exclude_user_id=actor_id,
+        )
+        notify_ticket_owner(
+            db, ticket, "escalation",
+            f"Your request #{ticket['id']} needs additional support",
+            f"IT advanced your request to {target} under the configured SLA workflow.",
+        )
+        escalated.append({
+            "ticket_id": ticket["id"], "title": ticket["title"],
+            "priority": ticket["priority"], "level": next_level,
+            "target": target, "overdue_minutes": overdue_minutes,
+        })
+
+    return {
+        "checked": len(tickets),
+        "escalated": escalated,
+        "escalated_count": len(escalated),
+        "skipped_invalid_due_dates": skipped,
+        "checked_at": now_iso(),
+    }
+
+
 def init_db() -> None:
     database_path = Path(app.config["DATABASE"])
     database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -604,6 +778,29 @@ def init_db() -> None:
                 actor TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS workflow_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                priority TEXT NOT NULL CHECK(priority IN ('Low','Medium','High','Critical')),
+                escalation_level INTEGER NOT NULL CHECK(escalation_level BETWEEN 1 AND 3),
+                overdue_minutes INTEGER NOT NULL DEFAULT 0 CHECK(overdue_minutes BETWEEN 0 AND 43200),
+                target_role TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                updated_by INTEGER REFERENCES users(id),
+                updated_at TEXT NOT NULL,
+                UNIQUE(priority, escalation_level)
+            );
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                actor_id INTEGER REFERENCES users(id),
+                actor_name TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
             CREATE INDEX IF NOT EXISTS idx_tickets_priority ON tickets(priority);
             CREATE INDEX IF NOT EXISTS idx_tickets_due ON tickets(due_at);
@@ -611,6 +808,14 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, id);
             CREATE INDEX IF NOT EXISTS idx_activity_id ON activity(id);
             CREATE INDEX IF NOT EXISTS idx_email_outbox_created ON email_outbox(created_at);
+            CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id, id);
+            CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at, id);
+            CREATE TRIGGER IF NOT EXISTS audit_events_no_update
+            BEFORE UPDATE ON audit_events
+            BEGIN SELECT RAISE(ABORT, 'Audit events are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS audit_events_no_delete
+            BEFORE DELETE ON audit_events
+            BEGIN SELECT RAISE(ABORT, 'Audit events are immutable'); END;
             """
         )
         ticket_columns = {row["name"] for row in db.execute("PRAGMA table_info(tickets)")}
@@ -627,6 +832,14 @@ def init_db() -> None:
                     "INSERT INTO users (email, full_name, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
                     (email, full_name, generate_password_hash(password), role, now_iso()),
                 )
+        if db.execute("SELECT COUNT(*) FROM workflow_rules").fetchone()[0] == 0:
+            db.executemany(
+                """INSERT INTO workflow_rules
+                (priority, escalation_level, overdue_minutes, target_role, updated_at)
+                VALUES (?, ?, ?, ?, ?)""",
+                [(priority, level, minutes, target, now_iso())
+                 for priority, level, minutes, target in default_workflow_rules()],
+            )
         if db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0] == 0:
             seed_demo_data(db)
         # Backfill historical demo/legacy resolved rows without replacing any ticket data.
@@ -944,6 +1157,12 @@ def tickets_page():
              now_iso(), now_iso(), due.replace(microsecond=0).isoformat(timespec="seconds")),
         )
         log_activity(db, "Ticket created", f"#{cursor.lastrowid} · {title[:100]} · {priority} priority", g.user["full_name"])
+        write_audit_event(
+            db, "ticket", cursor.lastrowid, "Ticket created",
+            f"Incident #{cursor.lastrowid} created with {priority} priority and {category} category.",
+            g.user["id"], g.user["full_name"],
+            {"priority": priority, "category": category, "assignee": assignee},
+        )
         notify_roles(
             db, ("Admin", "IT Agent"), "ticket", f"Incident #{cursor.lastrowid} created",
             f"{g.user['full_name']} logged: {title[:120]}",
@@ -1002,6 +1221,18 @@ def ticket_detail(ticket_id: int):
             (status, priority, assignee or "Unassigned", updated_at, resolved_at, ticket_id),
         )
         log_activity(db, "Ticket updated", f"#{ticket_id} ? status: {status} ? priority: {priority}", g.user["full_name"])
+        changes = {}
+        for field, new_value in (("status", status), ("priority", priority), ("assignee", assignee or "Unassigned")):
+            if ticket[field] != new_value:
+                changes[field] = {"from": ticket[field], "to": new_value}
+        if changes:
+            write_audit_event(
+                db, "ticket", ticket_id, "Ticket updated",
+                f"Incident #{ticket_id} changed: " + ", ".join(
+                    f"{field} {values['from']} → {values['to']}" for field, values in changes.items()
+                ),
+                g.user["id"], g.user["full_name"], changes,
+            )
         if status != ticket["status"] or priority != ticket["priority"]:
             notify_ticket_owner(
                 db, ticket, "status",
@@ -1015,9 +1246,17 @@ def ticket_detail(ticket_id: int):
     escalation_history = db.execute(
         "SELECT * FROM ticket_escalations WHERE ticket_id = ? ORDER BY id DESC", (ticket_id,)
     ).fetchall()
+    assignment_suggestions = (
+        suggest_ticket_assignees(db, ticket) if g.user["role"] in ("Admin", "IT Agent") else []
+    )
+    audit_history = db.execute(
+        """SELECT * FROM audit_events WHERE entity_type='ticket' AND entity_id=?
+        ORDER BY id DESC LIMIT 8""", (str(ticket_id),)
+    ).fetchall()
     return render_template("ticket_detail.html", active_page="tickets", ticket=ticket,
                            sla=ticket_sla(ticket), suggested_priority=suggested_priority, triage_reason=triage_reason,
-                           escalation_history=escalation_history, escalation_targets=ESCALATION_TARGETS)
+                           escalation_history=escalation_history, escalation_targets=ESCALATION_TARGETS,
+                           assignment_suggestions=assignment_suggestions, audit_history=audit_history)
 
 
 @app.post("/tickets/<int:ticket_id>/escalate")
@@ -1049,6 +1288,11 @@ def escalate_ticket(ticket_id: int):
     db.execute("UPDATE tickets SET escalation_level = ?, updated_at = ? WHERE id = ?",
                (next_level, now_iso(), ticket_id))
     log_activity(db, "Incident escalated", f"#{ticket_id} ? Level {next_level} ? {target}", actor)
+    write_audit_event(
+        db, "ticket", ticket_id, "Manual escalation",
+        f"Incident #{ticket_id} manually escalated to {target}.",
+        g.user["id"], actor, {"level": next_level, "target_role": target, "reason": reason},
+    )
     notify_roles(
         db, ("Admin", "IT Agent"), "escalation",
         f"Incident #{ticket_id} escalated",
@@ -1464,6 +1708,231 @@ def assistant_recurrences_api():
     days = min(365, max(7, days))
     tickets = get_db().execute("SELECT * FROM tickets ORDER BY created_at DESC").fetchall()
     return jsonify({"days": days, "patterns": detect_recurring_incidents(tickets, days)})
+
+
+@app.route("/workflow")
+@roles_required("Admin", "IT Agent")
+def workflow_page():
+    db = get_db()
+    rules = db.execute(
+        """SELECT * FROM workflow_rules
+        ORDER BY CASE priority WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 ELSE 4 END,
+        escalation_level"""
+    ).fetchall()
+    audit = db.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT 12").fetchall()
+    active_tickets = db.execute(
+        "SELECT * FROM tickets WHERE status != 'Resolved' ORDER BY due_at ASC"
+    ).fetchall()
+    overdue_count = sum(ticket_sla(ticket) == "breached" for ticket in active_tickets)
+    return render_template(
+        "workflow.html", active_page="workflow", rules=rules, recent_audit=audit,
+        active_count=len(active_tickets), overdue_count=overdue_count,
+    )
+
+
+@app.post("/workflow/rules/save")
+@roles_required("Admin")
+def save_workflow_rule():
+    db = get_db()
+    rule_id = request.form.get("rule_id", type=int)
+    priority = request.form.get("priority", "")
+    level = request.form.get("escalation_level", type=int)
+    overdue_minutes = request.form.get("overdue_minutes", type=int)
+    is_active = 1 if request.form.get("is_active", "1") == "1" else 0
+    if priority not in PRIORITIES or level not in ESCALATION_TARGETS or overdue_minutes is None or not 0 <= overdue_minutes <= 43200:
+        flash("Choose a valid priority, escalation level and delay between 0 and 43,200 minutes.", "error")
+        return redirect(url_for("workflow_page"))
+    target = ESCALATION_TARGETS[level]
+    try:
+        if rule_id:
+            existing = db.execute("SELECT id FROM workflow_rules WHERE id = ?", (rule_id,)).fetchone()
+            if not existing:
+                abort(404)
+            db.execute(
+                """UPDATE workflow_rules
+                SET priority=?, escalation_level=?, overdue_minutes=?, target_role=?,
+                    is_active=?, updated_by=?, updated_at=? WHERE id=?""",
+                (priority, level, overdue_minutes, target, is_active, g.user["id"], now_iso(), rule_id),
+            )
+        else:
+            db.execute(
+                """INSERT INTO workflow_rules
+                (priority, escalation_level, overdue_minutes, target_role, is_active, updated_by, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (priority, level, overdue_minutes, target, is_active, g.user["id"], now_iso()),
+            )
+        write_audit_event(
+            db, "workflow_rule", rule_id or f"{priority}-{level}", "Rule saved",
+            f"{priority} incidents escalate to {target} at {overdue_minutes} minutes past SLA.",
+            g.user["id"], g.user["full_name"],
+            {"priority": priority, "level": level, "overdue_minutes": overdue_minutes,
+             "target_role": target, "is_active": bool(is_active)},
+        )
+        log_activity(db, "SLA workflow rule saved", f"{priority} → Level {level} → {overdue_minutes} min", g.user["full_name"])
+        db.commit()
+        flash("Workflow rule saved.", "success")
+    except sqlite3.IntegrityError:
+        db.rollback()
+        flash("A rule for that priority and escalation level already exists. Edit the existing row instead.", "error")
+    return redirect(url_for("workflow_page"))
+
+
+@app.post("/workflow/rules/<int:rule_id>/toggle")
+@roles_required("Admin")
+def toggle_workflow_rule(rule_id: int):
+    db = get_db()
+    rule = db.execute("SELECT * FROM workflow_rules WHERE id = ?", (rule_id,)).fetchone()
+    if rule is None:
+        abort(404)
+    active = 0 if rule["is_active"] else 1
+    db.execute(
+        "UPDATE workflow_rules SET is_active=?, updated_by=?, updated_at=? WHERE id=?",
+        (active, g.user["id"], now_iso(), rule_id),
+    )
+    write_audit_event(
+        db, "workflow_rule", rule_id, "Rule enabled" if active else "Rule disabled",
+        f"{rule['priority']} level {rule['escalation_level']} rule {'enabled' if active else 'disabled'}.",
+        g.user["id"], g.user["full_name"],
+        {"priority": rule["priority"], "level": rule["escalation_level"], "is_active": bool(active)},
+    )
+    db.commit()
+    flash("Workflow rule " + ("enabled." if active else "paused."), "success")
+    return redirect(url_for("workflow_page"))
+
+
+@app.post("/workflow/run-sla")
+@roles_required("Admin", "IT Agent")
+def run_sla_workflow():
+    db = get_db()
+    result = run_sla_escalation_check(db, g.user["id"], g.user["full_name"])
+    write_audit_event(
+        db, "workflow_run", "sla-escalation", "SLA check completed",
+        f"Checked {result['checked']} active incidents; escalated {result['escalated_count']}.",
+        g.user["id"], g.user["full_name"], result,
+    )
+    db.commit()
+    if result["escalated_count"]:
+        flash(f"SLA check complete: {result['escalated_count']} incident(s) escalated.", "success")
+    else:
+        flash(f"SLA check complete: {result['checked']} active incident(s) checked; no new escalation stages were due.", "success")
+    return redirect(url_for("workflow_page"))
+
+
+@app.route("/audit-log")
+@roles_required("Admin", "IT Agent")
+def audit_log_page():
+    q = request.args.get("q", "").strip()[:100]
+    if q:
+        pattern = f"%{q}%"
+        rows = get_db().execute(
+            """SELECT * FROM audit_events
+            WHERE actor_name LIKE ? OR action LIKE ? OR summary LIKE ? OR entity_id LIKE ?
+            ORDER BY id DESC LIMIT 250""",
+            (pattern, pattern, pattern, pattern),
+        ).fetchall()
+    else:
+        rows = get_db().execute(
+            "SELECT * FROM audit_events ORDER BY id DESC LIMIT 250"
+        ).fetchall()
+    return render_template("audit_log.html", active_page="audit", events=rows, q=q)
+
+
+@app.route("/export/daily-operations.csv")
+@roles_required("Admin", "IT Agent")
+def export_daily_operations():
+    db = get_db()
+    summary = build_daily_operations_summary(db)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["PulseDesk daily operations brief", summary["date_label"]])
+    writer.writerow([])
+    writer.writerow(["Metric", "Value"])
+    for label, key in (
+        ("All incidents", "total"), ("Created today", "created_today"),
+        ("Resolved today", "resolved_today"), ("Active queue", "active"),
+        ("Critical active", "critical"), ("Overdue active", "overdue"),
+        ("Unassigned active", "unassigned"), ("Largest active category", "top_category"),
+    ):
+        writer.writerow([label, summary[key]])
+    writer.writerow([])
+    writer.writerow(["Attention points"])
+    for item in summary["highlights"]:
+        writer.writerow([item])
+    writer.writerow([])
+    writer.writerow(["Recurring themes", "Matches", "Open", "Critical"])
+    for pattern in summary["patterns"]:
+        writer.writerow([pattern["theme"], pattern["count"], pattern["open_count"], pattern["critical_count"]])
+    writer.writerow([])
+    writer.writerow(["Open incident register", "Priority", "Status", "Assignee", "Due"])
+    active = db.execute(
+        "SELECT id, title, priority, status, assignee, due_at FROM tickets WHERE status != 'Resolved' ORDER BY due_at ASC"
+    ).fetchall()
+    for ticket in active:
+        writer.writerow([f"#{ticket['id']} {ticket['title']}", ticket["priority"], ticket["status"], ticket["assignee"], ticket["due_at"]])
+    write_audit_event(
+        db, "report", "daily-operations", "Daily report exported",
+        f"Daily operations CSV exported for {summary['date_label']}.",
+        g.user["id"], g.user["full_name"],
+        {"active": summary["active"], "overdue": summary["overdue"]},
+    )
+    db.commit()
+    response = make_response("\ufeff" + output.getvalue())
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = f"attachment; filename=pulsedesk-daily-operations-{datetime.now():%Y-%m-%d}.csv"
+    return response
+
+
+@app.post("/tickets/<int:ticket_id>/assign")
+@roles_required("Admin", "IT Agent")
+def assign_ticket(ticket_id: int):
+    db = get_db()
+    ticket = db.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+    if ticket is None:
+        abort(404)
+    if ticket["status"] == "Resolved":
+        flash("Resolved incidents cannot be reassigned.", "error")
+        return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+    assignee = request.form.get("assignee", "").strip()
+    candidate = db.execute(
+        "SELECT id, full_name FROM users WHERE full_name = ? AND active = 1 AND role IN ('Admin','IT Agent')",
+        (assignee,),
+    ).fetchone()
+    if not candidate:
+        flash("Choose an active Admin or IT Agent account.", "error")
+        return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+    previous = ticket["assignee"]
+    db.execute(
+        "UPDATE tickets SET assignee=?, updated_at=? WHERE id=?",
+        (candidate["full_name"], now_iso(), ticket_id),
+    )
+    log_activity(db, "Ticket assigned", f"#{ticket_id} → {candidate['full_name']}", g.user["full_name"])
+    write_audit_event(
+        db, "ticket", ticket_id, "Assignee changed",
+        f"Incident #{ticket_id} reassigned from {previous} to {candidate['full_name']}.",
+        g.user["id"], g.user["full_name"],
+        {"previous_assignee": previous, "new_assignee": candidate["full_name"]},
+    )
+    create_notification(
+        db, candidate["id"], "assignment", f"Incident #{ticket_id} assigned",
+        f"{g.user['full_name']} assigned you: {ticket['title']}",
+        f"/tickets/{ticket_id}",
+    )
+    notify_ticket_owner(
+        db, ticket, "assignment", f"Request #{ticket_id} assigned",
+        f"Your request is now assigned to {candidate['full_name']}.",
+    )
+    db.commit()
+    flash(f"Incident #{ticket_id} assigned to {candidate['full_name']}.", "success")
+    return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+
+
+@app.route("/api/tickets/<int:ticket_id>/assignment-suggestions")
+@roles_required("Admin", "IT Agent")
+def assignment_suggestions_api(ticket_id: int):
+    ticket = get_db().execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+    if ticket is None:
+        abort(404)
+    return jsonify({"ticket_id": ticket_id, "suggestions": suggest_ticket_assignees(get_db(), ticket)})
 
 
 @app.route("/reports")
